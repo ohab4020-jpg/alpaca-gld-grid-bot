@@ -34,6 +34,12 @@ PAPER_TRADING = True
 DB_FILE = f"gridbot_{SYMBOL}.db"
 
 # =========================
+# SECURITY / CONTROL
+# =========================
+RUN_TOKEN = os.getenv("RUN_TOKEN")  # required to hit /run
+TRADING_ENABLED = os.getenv("TRADING_ENABLED", "true").lower() == "true"
+
+# =========================
 # ALPACA CLIENTS
 # =========================
 ALPACA_KEY = os.getenv("ALPACA_KEY")
@@ -46,6 +52,7 @@ trading = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=PAPER_TRADING)
 data_client = StockHistoricalDataClient(ALPACA_KEY, ALPACA_SECRET)
 
 app = Flask(__name__)
+
 # =========================
 # HEALTH CHECK (RENDER)
 # =========================
@@ -83,7 +90,7 @@ def init_db():
     """)
     conn.commit()
     conn.close()
-    log.info("Database initialized")
+    log.info(f"{SYMBOL} | Database initialized")
 
 def now():
     return datetime.now(timezone.utc).isoformat()
@@ -94,15 +101,12 @@ def round_price(p):
 # =========================
 # PRICE
 # =========================
-def get_price(symbol):
-    req = StockLatestTradeRequest(symbol_or_symbols=symbol)
-    trade = data_client.get_stock_latest_trade(req)[symbol]
+def get_price():
+    req = StockLatestTradeRequest(symbol_or_symbols=SYMBOL)
+    trade = data_client.get_stock_latest_trade(req)[SYMBOL]
     price = float(trade.price)
-
-    log.info(f"{symbol} | Last price fetched: {price}")
-
+    log.info(f"{SYMBOL} | Price check: {price}")
     return price
-
 
 # =========================
 # ORDER SYNC
@@ -120,7 +124,7 @@ def sync_orders():
                     "UPDATE lots SET buy_status='BOUGHT', buy_filled_price=? WHERE id=?",
                     (float(o.filled_avg_price), r["id"])
                 )
-                log.info(f"BUY FILLED @ {o.filled_avg_price}")
+                log.info(f"{SYMBOL} | BUY filled @ {o.filled_avg_price}")
         except:
             pass
 
@@ -133,7 +137,7 @@ def sync_orders():
                     "UPDATE lots SET sell_status='SOLD', sell_filled_price=? WHERE id=?",
                     (float(o.filled_avg_price), r["id"])
                 )
-                log.info(f"SELL FILLED @ {o.filled_avg_price}")
+                log.info(f"{SYMBOL} | SELL filled @ {o.filled_avg_price}")
         except:
             pass
 
@@ -143,30 +147,62 @@ def sync_orders():
 def deployed_capital():
     conn = db()
     cur = conn.cursor()
-    cur.execute("SELECT COALESCE(SUM(buy_filled_price * qty), 0) FROM lots WHERE buy_status='BOUGHT' AND sell_status IS NULL")
+    cur.execute("""
+        SELECT COALESCE(SUM(buy_filled_price * qty), 0)
+        FROM lots
+        WHERE buy_status='BOUGHT' AND sell_status IS NULL
+    """)
     used = cur.fetchone()[0]
-    cur.execute("SELECT COALESCE(SUM(buy_limit_price * qty), 0) FROM lots WHERE buy_status='BUY_SUBMITTED'")
+
+    cur.execute("""
+        SELECT COALESCE(SUM(buy_limit_price * qty), 0)
+        FROM lots
+        WHERE buy_status='BUY_SUBMITTED'
+    """)
     reserved = cur.fetchone()[0]
+
     conn.close()
     return used + reserved
+
+def open_buy_exists(price):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT COUNT(*) FROM lots
+        WHERE buy_status='BUY_SUBMITTED'
+        AND ABS(buy_limit_price - ?) < 0.0001
+    """, (price,))
+    exists = cur.fetchone()[0] > 0
+    conn.close()
+    return exists
 
 # =========================
 # MAIN CYCLE
 # =========================
 def run_cycle():
-    price = get_price(SYMBOL)
-    log.info(f"Price: {price}")
+    clock = trading.get_clock()
+    if not clock.is_open:
+        log.info(f"{SYMBOL} | Market closed — monitoring only")
+        return
 
+    price = get_price()
     sync_orders()
 
     conn = db()
     cur = conn.cursor()
 
-    # SELL
-    cur.execute("SELECT * FROM lots WHERE buy_status='BOUGHT' AND (sell_status IS NULL OR sell_status!='SOLD')")
+    # SELL LOGIC
+    cur.execute("""
+        SELECT * FROM lots
+        WHERE buy_status='BOUGHT'
+        AND (sell_status IS NULL OR sell_status!='SOLD')
+    """)
     for r in cur.fetchall():
         target = round_price(r["buy_filled_price"] * (1 + GRID_PERCENT))
         if price >= target:
+            if not TRADING_ENABLED:
+                log.info(f"{SYMBOL} | SELL blocked — trading disabled")
+                continue
             try:
                 o = trading.submit_order(
                     LimitOrderRequest(
@@ -177,42 +213,79 @@ def run_cycle():
                         time_in_force=TimeInForce.DAY
                     )
                 )
-                cur.execute(
-                    "UPDATE lots SET sell_status='SELL_SUBMITTED', sell_order_id=?, sell_limit_price=?, sell_created_at=? WHERE id=?",
-                    (o.id, target, now(), r["id"])
-                )
-                log.info(f"SELL ORDER @ {target}")
+                cur.execute("""
+                    UPDATE lots SET
+                        sell_status='SELL_SUBMITTED',
+                        sell_order_id=?,
+                        sell_limit_price=?,
+                        sell_created_at=?
+                    WHERE id=?
+                """, (o.id, target, now(), r["id"]))
+                log.info(f"{SYMBOL} | SELL placed @ {target}")
             except:
                 pass
 
     capital = deployed_capital()
 
-    if LOWER_BAND <= price <= UPPER_BAND and capital + ORDER_USD <= MAX_CAPITAL:
-        cur.execute("SELECT buy_filled_price FROM lots WHERE buy_status='BOUGHT' ORDER BY id DESC LIMIT 1")
-        row = cur.fetchone()
-        anchor = row[0] if row else price
-        buy_price = round_price(anchor * (1 - GRID_PERCENT))
+    # BUY LOGIC
+    if not (LOWER_BAND <= price <= UPPER_BAND):
+        log.info(f"{SYMBOL} | No trade — price outside band [{LOWER_BAND}, {UPPER_BAND}]")
+        conn.close()
+        return
 
-        if price <= buy_price:
-            qty = int(ORDER_USD // buy_price)
-            if qty > 0:
-                try:
-                    o = trading.submit_order(
-                        LimitOrderRequest(
-                            symbol=SYMBOL,
-                            qty=qty,
-                            side=OrderSide.BUY,
-                            limit_price=buy_price,
-                            time_in_force=TimeInForce.DAY
-                        )
-                    )
-                    cur.execute(
-                        "INSERT INTO lots (symbol, buy_order_id, buy_status, buy_limit_price, qty, buy_created_at) VALUES (?, ?, 'BUY_SUBMITTED', ?, ?, ?)",
-                        (SYMBOL, o.id, buy_price, qty, now())
-                    )
-                    log.info(f"BUY ORDER @ {buy_price}")
-                except:
-                    pass
+    if capital >= MAX_CAPITAL:
+        log.info(f"{SYMBOL} | BUY skipped — max capital reached (${MAX_CAPITAL})")
+        conn.close()
+        return
+
+    cur.execute("""
+        SELECT buy_filled_price FROM lots
+        WHERE buy_status='BOUGHT'
+        ORDER BY id DESC LIMIT 1
+    """)
+    row = cur.fetchone()
+    anchor = row[0] if row else price
+    buy_price = round_price(anchor * (1 - GRID_PERCENT))
+
+    if price > buy_price:
+        log.info(f"{SYMBOL} | Waiting for buy ≤ {buy_price}")
+        conn.close()
+        return
+
+    if open_buy_exists(buy_price):
+        log.info(f"{SYMBOL} | BUY skipped — duplicate grid level @ {buy_price}")
+        conn.close()
+        return
+
+    qty = int(ORDER_USD // buy_price)
+    if qty <= 0:
+        conn.close()
+        return
+
+    if not TRADING_ENABLED:
+        log.info(f"{SYMBOL} | BUY blocked — trading disabled")
+        conn.close()
+        return
+
+    try:
+        o = trading.submit_order(
+            LimitOrderRequest(
+                symbol=SYMBOL,
+                qty=qty,
+                side=OrderSide.BUY,
+                limit_price=buy_price,
+                time_in_force=TimeInForce.DAY
+            )
+        )
+        cur.execute("""
+            INSERT INTO lots (
+                symbol, buy_order_id, buy_status,
+                buy_limit_price, qty, buy_created_at
+            ) VALUES (?, ?, 'BUY_SUBMITTED', ?, ?, ?)
+        """, (SYMBOL, o.id, buy_price, qty, now()))
+        log.info(f"{SYMBOL} | BUY placed: {qty} @ {buy_price}")
+    except:
+        pass
 
     conn.commit()
     conn.close()
@@ -222,6 +295,11 @@ def run_cycle():
 # =========================
 @app.route("/run")
 def run():
+    token = request.headers.get("X-RUN-TOKEN")
+    if RUN_TOKEN and token != RUN_TOKEN:
+        log.warning(f"{SYMBOL} | Unauthorized /run attempt blocked")
+        return jsonify({"error": "unauthorized"}), 403
+
     run_cycle()
     return jsonify({"status": "ok", "symbol": SYMBOL})
 
@@ -230,6 +308,6 @@ def run():
 # =========================
 if __name__ == "__main__":
     init_db()
+    log.info(f"{SYMBOL} | Bot started")
     port = int(os.getenv("PORT", 10000))
-    log.info("Bot started")
     app.run(host="0.0.0.0", port=port)
