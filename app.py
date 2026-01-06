@@ -46,6 +46,12 @@ trading = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=PAPER_TRADING)
 data_client = StockHistoricalDataClient(ALPACA_KEY, ALPACA_SECRET)
 
 app = Flask(__name__)
+# =========================
+# HEALTH CHECK (RENDER)
+# =========================
+@app.route("/healthz", methods=["GET"])
+def healthz():
+    return "ok", 200
 
 # =========================
 # DATABASE
