@@ -24,9 +24,9 @@ log = logging.getLogger(__name__)
 # CONFIG (EDIT ONLY THIS)
 # =========================
 SYMBOL = "GLD"
-LOWER_BAND = 383.44
-UPPER_BAND = 411.16
-GRID_PERCENT = 0.005
+LOWER_BAND = 380
+UPPER_BAND = 430
+GRID_PERCENT = 0.006
 ORDER_USD = 500
 MAX_CAPITAL = 10000
 
