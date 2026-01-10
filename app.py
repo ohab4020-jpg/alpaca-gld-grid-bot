@@ -1,236 +1,150 @@
 import os
-import math
-import sqlite3
+import threading
 import logging
-import requests
-from datetime import datetime, timezone, date
-
-from flask import Flask, jsonify, request
-
+from flask import Flask, request, jsonify
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import LimitOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockLatestTradeRequest
+from alpaca.data.live import StockDataStream
 
-# ============================================================
-# LOGGING
-# ============================================================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
-log = logging.getLogger("Leo")
+# =======================
+# CONFIG
+# =======================
 
-# ============================================================
-# TELEGRAM
-# ============================================================
-TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TG_CHAT = os.getenv("TELEGRAM_CHAT_ID")
-
-def tg(msg: str):
-    if not TG_TOKEN or not TG_CHAT:
-        return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT, "text": msg}
-        )
-    except Exception:
-        pass
-
-# ============================================================
-# GLOBAL SETTINGS
-# ============================================================
-PAPER_TRADING = os.getenv("PAPER_TRADING", "true").lower() == "true"
-TRADING_ENABLED = os.getenv("TRADING_ENABLED", "true").lower() == "true"
-
-ALPACA_KEY = os.getenv("ALPACA_KEY")
-ALPACA_SECRET = os.getenv("ALPACA_SECRET")
-
-if not ALPACA_KEY or not ALPACA_SECRET:
-    raise RuntimeError("Missing Alpaca API keys")
-
-trading = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=PAPER_TRADING)
-data_client = StockHistoricalDataClient(ALPACA_KEY, ALPACA_SECRET)
-
-# ============================================================
-# BOT CONFIG (FINAL — CONFIRMED)
-# ============================================================
 BOTS = {
     "GLD": {
         "lower": 365.76,
         "upper": 436.84,
-        "grid_pct": 0.005,
+        "grid_pct": 0.005,      # 0.5%
         "order_usd": 1000,
         "max_capital": 35000
     },
     "SLV": {
         "lower": 63.00,
         "upper": 77.48,
-        "grid_pct": 0.005,
+        "grid_pct": 0.005,      # 0.5%
         "order_usd": 1500,
         "max_capital": 60000
     }
 }
 
-# ============================================================
-# APP
-# ============================================================
+RUN_TOKEN = os.getenv("RUN_TOKEN")
+ALPACA_KEY = os.getenv("ALPACA_API_KEY")
+ALPACA_SECRET = os.getenv("ALPACA_SECRET_KEY")
+PAPER = True
+
+# =======================
+# LOGGING
+# =======================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+# =======================
+# INIT
+# =======================
+
 app = Flask(__name__)
+trading = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=PAPER)
 
-@app.route("/healthz")
-def healthz():
-    return "ok", 200
+run_lock = threading.Lock()
 
-# ============================================================
-# DATABASE
-# ============================================================
-def db(symbol):
-    conn = sqlite3.connect(f"leo_{symbol}.db", check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+# =======================
+# HELPERS
+# =======================
 
-def init_db(symbol):
-    conn = db(symbol)
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS lots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            buy_price REAL,
-            sell_price REAL,
-            qty INTEGER,
-            buy_time TEXT,
-            sell_time TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
+def get_open_orders(symbol):
+    return [o for o in trading.get_orders() if o.symbol == symbol and o.status == "accepted"]
 
-# ============================================================
-# PRICE
-# ============================================================
-def get_price(symbol):
-    trade = data_client.get_stock_latest_trade(
-        StockLatestTradeRequest(symbol_or_symbols=symbol)
-    )[symbol]
-    price = float(trade.price)
-    log.info(f"📈 {symbol} PRICE = {price}")
-    return price
+def get_position_qty(symbol):
+    try:
+        pos = trading.get_open_position(symbol)
+        return float(pos.qty)
+    except:
+        return 0.0
 
-# ============================================================
-# CAPITAL
-# ============================================================
-def used_capital(symbol):
-    conn = db(symbol)
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT COALESCE(SUM(buy_price * qty),0)
-        FROM lots
-        WHERE sell_price IS NULL
-    """)
-    val = cur.fetchone()[0]
-    conn.close()
-    return val
+def grid_prices(lower, upper, pct):
+    prices = []
+    p = lower
+    while p <= upper:
+        prices.append(round(p, 2))
+        p *= (1 + pct)
+    return prices
 
-# ============================================================
-# DAILY P&L
-# ============================================================
-def daily_pnl(symbol):
-    today = date.today().isoformat()
-    conn = db(symbol)
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT COALESCE(SUM((sell_price - buy_price) * qty),0)
-        FROM lots
-        WHERE sell_time LIKE ?
-    """, (f"{today}%",))
-    pnl = cur.fetchone()[0]
-    conn.close()
-    return round(pnl, 2)
-
-# ============================================================
+# =======================
 # CORE LOGIC
-# ============================================================
+# =======================
+
 def run_bot(symbol, cfg):
-    price = get_price(symbol)
-    cap_used = used_capital(symbol)
+    price = trading.get_latest_trade(symbol).price
+    logging.info(f"📈 {symbol} PRICE = {price}")
 
-    conn = db(symbol)
-    cur = conn.cursor()
+    grids = grid_prices(cfg["lower"], cfg["upper"], cfg["grid_pct"])
+    open_orders = get_open_orders(symbol)
+    open_prices = {float(o.limit_price) for o in open_orders}
 
-    # ---------------- SELL ----------------
-    cur.execute("SELECT * FROM lots WHERE sell_price IS NULL")
-    for r in cur.fetchall():
-        target = round(r["buy_price"] * (1 + cfg["grid_pct"]), 2)
-        if price >= target:
+    owned_qty = get_position_qty(symbol)
+
+    for gp in grids:
+        qty = round(cfg["order_usd"] / gp, 4)
+
+        # BUY LOGIC
+        if gp < price and gp not in open_prices:
+            logging.info(f"🟢 BUY | {symbol} | {qty} @ {gp}")
             trading.submit_order(
                 LimitOrderRequest(
                     symbol=symbol,
-                    qty=r["qty"],
+                    qty=qty,
+                    side=OrderSide.BUY,
+                    limit_price=gp,
+                    time_in_force=TimeInForce.GTC
+                )
+            )
+            break  # one order per run
+
+        # SELL LOGIC (LONG ONLY)
+        if gp > price and owned_qty >= qty and gp not in open_prices:
+            logging.info(f"🔴 SELL | {symbol} | {qty} @ {gp}")
+            trading.submit_order(
+                LimitOrderRequest(
+                    symbol=symbol,
+                    qty=qty,
                     side=OrderSide.SELL,
-                    limit_price=target,
-                    time_in_force=TimeInForce.DAY
+                    limit_price=gp,
+                    time_in_force=TimeInForce.GTC
                 )
             )
-            cur.execute(
-                "UPDATE lots SET sell_price=?, sell_time=? WHERE id=?",
-                (target, datetime.now(timezone.utc).isoformat(), r["id"])
-            )
-            msg = f"🔴 SELL | {symbol}\nQty: {r['qty']} @ {target}"
-            log.info(msg)
-            tg(msg)
+            break
 
-    # ---------------- BUY ----------------
-    if not TRADING_ENABLED:
-        conn.commit()
-        conn.close()
-        return
+# =======================
+# ROUTES
+# =======================
 
-    if cfg["lower"] <= price <= cfg["upper"]:
-        if cap_used + cfg["order_usd"] <= cfg["max_capital"]:
-            buy_price = round(price * (1 - cfg["grid_pct"]), 2)
-            qty = int(cfg["order_usd"] // buy_price)
-            if qty > 0:
-                trading.submit_order(
-                    LimitOrderRequest(
-                        symbol=symbol,
-                        qty=qty,
-                        side=OrderSide.BUY,
-                        limit_price=buy_price,
-                        time_in_force=TimeInForce.DAY
-                    )
-                )
-                cur.execute(
-                    "INSERT INTO lots VALUES (NULL,?,?,?, ?,NULL)",
-                    (buy_price, None, qty, datetime.now(timezone.utc).isoformat())
-                )
-                msg = f"🟢 BUY | {symbol}\nQty: {qty} @ {buy_price}"
-                log.info(msg)
-                tg(msg)
-
-    conn.commit()
-    conn.close()
-
-    pnl = daily_pnl(symbol)
-    log.info(f"📊 DAILY P&L | {symbol} = ${pnl}")
-    tg(f"📊 DAILY P&L | {symbol}\n${pnl}")
-
-# ============================================================
-# ROUTE
-# ============================================================
-@app.route("/run")
+@app.route("/run", methods=["GET"])
 def run():
-    for symbol, cfg in BOTS.items():
-        init_db(symbol)
-        run_bot(symbol, cfg)
-    return jsonify({"status": "ok", "bots": list(BOTS.keys())})
+    if request.headers.get("X-RUN-TOKEN") != RUN_TOKEN:
+        return jsonify({"error": "Unauthorized /run attempt blocked"}), 401
 
-# ============================================================
+    if not run_lock.acquire(blocking=False):
+        return jsonify({"status": "already running"}), 200
+
+    try:
+        for symbol, cfg in BOTS.items():
+            run_bot(symbol, cfg)
+        return jsonify({"bots": list(BOTS.keys()), "status": "ok"})
+    finally:
+        run_lock.release()
+
+@app.route("/healthz")
+def health():
+    return "ok", 200
+
+# =======================
 # START
-# ============================================================
+# =======================
+
 if __name__ == "__main__":
-    for s in BOTS:
-        init_db(s)
-    log.info("🦁 Leo started (Paper Trading)")
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+    logging.info("🦁 Leo started (Paper Trading)")
+    app.run(host="0.0.0.0", port=10000)
