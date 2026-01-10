@@ -250,10 +250,9 @@ def open_sell_qty(open_orders) -> float:
 
 def place_limit(symbol: str, side: str, qty: float, price: float):
     if not TRADING_ENABLED:
-        msg = f"⛔️ TRADING DISABLED | blocked {side.upper()} {symbol}"
-        log.info(msg)
-        tg_send(msg)
-        return None
+    log.info(f"⛔️ TRADING DISABLED | blocked {side.upper()} {symbol}")
+    return None
+
 
     req = LimitOrderRequest(
         symbol=symbol,
