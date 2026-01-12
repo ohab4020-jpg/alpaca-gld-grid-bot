@@ -31,16 +31,16 @@ BOTS = {
     "GLD": {
         "lower": 365.76,
         "upper": 436.84,
-        "grid_pct": 0.003,      # 0.3% geometric spacing
-        "order_usd": 3000,      # you can change later
-        "max_capital": 90000
+        "grid_pct": 0.005,      # 0.5% geometric spacing
+        "order_usd": 1000,      # you can change later
+        "max_capital": 35000
     },
     "SLV": {
-        "lower": 70,
-        "upper": 81.82,
-        "grid_pct": 0.003,      # 0.3% geometric spacing
-        "order_usd": 3000,      # you can change later
-        "max_capital": 90000
+        "lower": 63.00,
+        "upper": 77.48,
+        "grid_pct": 0.005,      # 0.5% geometric spacing
+        "order_usd": 1500,      # you can change later
+        "max_capital": 60000
     }
 }
 
@@ -55,6 +55,9 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # Send daily summary after this UTC hour (0-23). (Example: 20 = 20:00 UTC)
 DAILY_SUMMARY_HOUR_UTC = int(os.getenv("DAILY_SUMMARY_HOUR_UTC", "20"))
+
+# NEW: inventory-level tolerance (default 0.2% = 0.002)
+INVENTORY_LEVEL_TOLERANCE_PCT = float(os.getenv("INVENTORY_LEVEL_TOLERANCE_PCT", "0.002"))
 
 
 # =======================
@@ -175,6 +178,25 @@ def get_open_orders(symbol: str):
         symbols=[symbol]
     )
     return trading.get_orders(filter=req)
+
+
+# =======================
+# NEW: INVENTORY AT GRID LEVEL CHECK
+# =======================
+def has_inventory_at_level(symbol: str, level: float, tolerance_pct: float = INVENTORY_LEVEL_TOLERANCE_PCT) -> bool:
+    """
+    Blocks re-buying the same grid level if our existing position avg entry is close to that level.
+    tolerance_pct default: 0.2% (0.002)
+    """
+    try:
+        pos = trading.get_open_position(symbol)
+        avg_price = float(pos.avg_entry_price)
+        lvl = float(level)
+        if lvl <= 0:
+            return False
+        return abs(avg_price - lvl) / lvl <= float(tolerance_pct)
+    except Exception:
+        return False
 
 
 # =======================
@@ -370,6 +392,11 @@ def run_symbol(symbol: str, cfg: dict):
         buy_qty = math.floor(order_usd / buy_level)
         if buy_qty <= 0:
             return {"symbol": symbol, "action": "none", "reason": "buy_qty_zero"}
+
+        # NEW: block re-buying the same grid level when inventory already exists at that level
+        if has_inventory_at_level(symbol, buy_level):
+            log.info(f"🟡 {symbol} inventory already exists near {buy_level}, skipping BUY")
+            return {"symbol": symbol, "action": "none", "reason": "inventory_exists", "price": last_price}
 
         projected = used + (buy_qty * buy_level)
         if projected > max_capital:
