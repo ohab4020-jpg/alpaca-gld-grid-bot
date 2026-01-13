@@ -43,7 +43,13 @@ BOTS = {
         "max_capital": 50000
     }
 }
-
+"MARA": {
+    "lower": 7,
+    "upper": 16,
+    "grid_pct": 0.01,   # ⚠️ 1% = 0.01, NOT 1.0
+    "order_usd": 3000,
+    "max_capital": 60000
+}
 PAPER = os.getenv("PAPER_TRADING", "true").lower() == "true"
 TRADING_ENABLED = os.getenv("TRADING_ENABLED", "true").lower() == "true"
 
