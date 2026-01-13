@@ -31,74 +31,75 @@ BOTS = {
     "GLD": {
         "lower": 403.28,
         "upper": 436.84,
-        "grid_pct": 0.004,      # 0.4% geometric spacing
-        "order_usd": 2500,      # you can change later
+        "grid_pct": 0.004,
+        "order_usd": 2500,
         "max_capital": 30000
     },
     "SLV": {
         "lower": 70.80,
         "upper": 81.82,
-        "grid_pct": 0.006,      # 0.6% geometric spacing
-        "order_usd": 2500,      # you can change later
+        "grid_pct": 0.006,
+        "order_usd": 2500,
         "max_capital": 30000
-    }
-}
+    },
     "MARA": {
         "lower": 9.0,
         "upper": 16.50,
-        "grid_pct": 0.015,      # 0.15% geometric spacing
-        "order_usd": 2500,      # you can change later
+        "grid_pct": 0.015,
+        "order_usd": 2500,
         "max_capital": 30000
     },
     "MSTR": {
         "lower": 148.00,
         "upper": 177.00,
-        "grid_pct": 0.015,      # 0.15% geometric spacing
-        "order_usd": 2500,      # you can change later
+        "grid_pct": 0.015,
+        "order_usd": 2500,
         "max_capital": 30000
     },
     "BTBT": {
         "lower": 1.87,
         "upper": 3.37,
-        "grid_pct": 0.015,      # 0.15% geometric spacing
-        "order_usd": 2500,      # you can change later
+        "grid_pct": 0.015,
+        "order_usd": 2500,
         "max_capital": 30000
     },
     "RSP": {
         "lower": 191.15,
         "upper": 204.76,
-        "grid_pct": 0.005,      # 0.5% geometric spacing
-        "order_usd": 2500,      # you can change later
+        "grid_pct": 0.005,
+        "order_usd": 2500,
         "max_capital": 30000
     },
     "GOOG": {
         "lower": 295.00,
         "upper": 360.96,
-        "grid_pct": 0.005,      # 0.5% geometric spacing
-        "order_usd": 2500,      # you can change later
+        "grid_pct": 0.005,
+        "order_usd": 2500,
         "max_capital": 30000
     },
-"AAPL": {
+    "AAPL": {
         "lower": 250.00,
         "upper": 298.00,
-        "grid_pct": 0.005,      # 0.5% geometric spacing
-        "order_usd": 2500,      # you can change later
+        "grid_pct": 0.005,
+        "order_usd": 2500,
         "max_capital": 30000
     },
-"MSFT": {
+    "MSFT": {
         "lower": 446.00,
         "upper": 526.00,
-        "grid_pct": 0.005,      # 0.4% geometric spacing
-        "order_usd": 2500,      # you can change later
+        "grid_pct": 0.005,
+        "order_usd": 2500,
         "max_capital": 30000
     },
-"AMZN": {
+    "AMZN": {
         "lower": 200.00,
         "upper": 265.96,
-        "grid_pct": 0.005,      # 0.4% geometric spacing
-        "order_usd": 2500,      # you can change later
+        "grid_pct": 0.005,
+        "order_usd": 2500,
         "max_capital": 30000
-    },
+    }
+}
+
 PAPER = os.getenv("PAPER_TRADING", "true").lower() == "true"
 TRADING_ENABLED = os.getenv("TRADING_ENABLED", "true").lower() == "true"
 
