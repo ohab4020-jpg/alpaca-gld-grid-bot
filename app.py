@@ -331,6 +331,21 @@ def db_delete_lot(conn, symbol: str, buy_level: float):
     with conn.cursor() as cur:
         cur.execute("DELETE FROM grid_lots WHERE symbol=%s AND buy_level=%s;", (symbol, d2(buy_level)))
 
+# >>> NEW PATCH: fetch seeded lot that should sell at this sell_level (seeded = buy_order_id is NULL/empty)
+def db_get_seeded_lot_for_sell_level(conn, symbol: str, sell_level: float):
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT *
+            FROM grid_lots
+            WHERE symbol=%s
+              AND state='owned'
+              AND sell_level=%s
+              AND (buy_order_id IS NULL OR buy_order_id='')
+            ORDER BY buy_level DESC
+            LIMIT 1;
+        """, (symbol, d2(sell_level)))
+        return cur.fetchone()
+
 def reconcile_lots(conn, symbol: str, open_orders):
     """
     If an order we tracked as buy_open/sell_open is no longer open,
@@ -384,11 +399,16 @@ def reconcile_lots(conn, symbol: str, open_orders):
 # If you already hold a position but grid_lots is empty (e.g., after a fork/redeploy),
 # create ONE owned lot at the closest grid level to avg_entry_price.
 # This is idempotent: once lots exist for the symbol, it won’t keep changing anything.
-def seed_one_lot_if_needed(conn, symbol: str, levels):
+# ALSO: only seed when there are NO open orders (matches “bot hasn’t started orders yet”).
+def seed_one_lot_if_needed(conn, symbol: str, levels, open_orders):
     try:
-        # If memory already exists for this symbol, do nothing (keeps your current behavior)
+        # If memory already exists for this symbol, do nothing
         existing_lots = db_list_lots(conn, symbol)
         if existing_lots:
+            return
+
+        # If there are open orders already, do not seed
+        if open_orders:
             return
 
         qty = get_position_qty(symbol)
@@ -470,7 +490,6 @@ def maybe_daily_summary(conn):
 # =======================
 # CORE BOT
 # =======================
-# >>> NEW/CHANGED: accept conn so we can read/write memory
 def run_symbol(conn, symbol: str, cfg: dict):
     lower = float(cfg["lower"])
     upper = float(cfg["upper"])
@@ -498,8 +517,8 @@ def run_symbol(conn, symbol: str, cfg: dict):
 
     open_orders = get_open_orders(symbol)
 
-    # >>> NEW PATCH (SIMPLE SEED): only seeds if grid_lots empty for this symbol and you already hold shares
-    seed_one_lot_if_needed(conn, symbol, levels)
+    # >>> NEW PATCH (SIMPLE SEED): only seeds if grid_lots empty for this symbol, you hold shares, and no open orders
+    seed_one_lot_if_needed(conn, symbol, levels, open_orders)
 
     # >>> NEW/CHANGED: reconcile our DB memory with Alpaca order reality
     reconcile_lots(conn, symbol, open_orders)
@@ -517,8 +536,37 @@ def run_symbol(conn, symbol: str, cfg: dict):
             log.info(f"🟡 {symbol} buy/sell too close (buy={buy_level}, sell={sell_level}), skipping")
             return {"symbol": symbol, "action": "none", "reason": "min_tick_guard", "price": last_price}
 
-    # 1) SELL (only if we actually own the corresponding buy_level lot)
+    # 1) SELL
     if sell_level is not None:
+        # >>> NEW PATCH: if this sell_level matches the seeded lot's sell_level, sell ALL of the seeded qty
+        seeded_lot = db_get_seeded_lot_for_sell_level(conn, symbol, sell_level)
+        if seeded_lot:
+            seeded_qty = math.floor(float(seeded_lot["qty"]))
+            sell_qty = min(seeded_qty, math.floor(free_qty))
+            if sell_qty > 0 and not has_open_order_at(open_orders, "sell", sell_level):
+                try:
+                    o = place_limit(symbol, "sell", sell_qty, sell_level)
+                    if o:
+                        db_upsert_lot(
+                            conn, symbol,
+                            float(seeded_lot["buy_level"]),
+                            float(seeded_lot["sell_level"]),
+                            sell_qty,
+                            "sell_open",
+                            buy_order_id=seeded_lot.get("buy_order_id"),
+                            sell_order_id=str(o.id)
+                        )
+                        msg = f"🔴 SELL (SEEDED) | {symbol}\nQty: {sell_qty} @ {sell_level}"
+                        log.info(msg.replace("\n", " | "))
+                        tg_send(msg)
+                        return {"symbol": symbol, "action": "sell", "qty": sell_qty, "price": sell_level, "seeded": True}
+                except Exception as e:
+                    msg = f"❌ SELL failed | {symbol} | {e}"
+                    log.error(msg)
+                    tg_send(msg)
+                    return {"symbol": symbol, "action": "error", "reason": "sell_failed"}
+
+        # --- existing sell logic unchanged ---
         sell_qty = math.floor(order_usd / sell_level)
         if sell_qty > 0 and free_qty >= sell_qty:
             # the lot we should be selling is the grid step immediately below this sell_level
@@ -557,7 +605,7 @@ def run_symbol(conn, symbol: str, cfg: dict):
         if buy_qty <= 0:
             return {"symbol": symbol, "action": "none", "reason": "buy_qty_zero"}
 
-        # >>> NEW/CHANGED: DB-based "memory" check (this is the real fix)
+        # >>> DB-based "memory" check
         existing = db_get_lot(conn, symbol, buy_level)
         if existing and existing["state"] in ("buy_open", "owned", "sell_open"):
             log.info(f"🟡 {symbol} already has memory at buy_level={buy_level} (state={existing['state']}), skipping BUY")
@@ -579,7 +627,7 @@ def run_symbol(conn, symbol: str, cfg: dict):
                         # no next level to sell into; don't buy
                         return {"symbol": symbol, "action": "none", "reason": "no_sell_target"}
 
-                    # >>> NEW/CHANGED: write memory (pending buy)
+                    # write memory (pending buy)
                     db_upsert_lot(
                         conn, symbol,
                         buy_level,
@@ -624,7 +672,6 @@ def run():
 
         results = []
         for sym, cfg in BOTS.items():
-            # >>> NEW/CHANGED: pass conn
             results.append(run_symbol(conn, sym, cfg))
 
         maybe_daily_summary(conn)
