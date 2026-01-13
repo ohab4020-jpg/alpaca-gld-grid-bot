@@ -33,23 +33,38 @@ BOTS = {
         "upper": 436.84,
         "grid_pct": 0.004,      # 0.4% geometric spacing
         "order_usd": 3000,      # you can change later
-        "max_capital": 50000
+        "max_capital": 30000
     },
     "SLV": {
         "lower": 70.80,
         "upper": 81.82,
         "grid_pct": 0.006,      # 0.6% geometric spacing
         "order_usd": 3000,      # you can change later
-        "max_capital": 50000
+        "max_capital": 30000
     }
 }
 "MARA": {
     "lower": 7,
-    "upper": 16,
-    "grid_pct": 0.01,   # ⚠️ 1% = 0.01, NOT 1.0
+    "upper": 10,
+    "grid_pct": 0.015,   # 0.15% geometric spacing
     "order_usd": 3000,
-    "max_capital": 60000
+    "max_capital": 30000
 }
+"MSTR": {
+    "lower": 148,
+    "upper": 177,
+    "grid_pct": 0.015,  # 0.15% geometric spacing
+    "order_usd": 3000,
+    "max_capital": 30000
+}
+"BTBT": {
+    "lower": 1.87,
+    "upper": 3.37,
+    "grid_pct": 0.015,   # 0.15% geometric spacing
+    "order_usd": 3000,
+    "max_capital": 30000
+}
+
 PAPER = os.getenv("PAPER_TRADING", "true").lower() == "true"
 TRADING_ENABLED = os.getenv("TRADING_ENABLED", "true").lower() == "true"
 
