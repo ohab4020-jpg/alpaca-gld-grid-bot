@@ -945,7 +945,31 @@ def reconcile_lots(conn, symbol: str, open_orders):
                 )
 
             else:
-                log.warning(f"🟠 {symbol} reconcile: sell_open order {sell_oid} not open, truth unknown -> keeping lot")
+                # ✅ AUTO-HEAL: trust positions over assumptions.
+                # If Alpaca cannot find the SELL leg anywhere (not open, not closed),
+                # but we still own shares, the stored sell_open is a phantom and should be cleared.
+                pos_qty = get_position_qty(symbol)
+                if o is None and pos_qty > 0.0:
+                    expected_qty = float(lot_qty) if float(lot_qty) > 0.0 else float(pos_qty)
+                    db_upsert_lot(
+                        conn,
+                        symbol,
+                        float(lot["buy_level"]),
+                        float(lot["sell_level"]),
+                        float(expected_qty),
+                        "owned",
+                        buy_order_id=buy_oid,
+                        sell_order_id=None,
+                    )
+                    log.info(
+                        f"🧠 {symbol} reconcile auto-heal: phantom SELL {sell_oid} cleared via position qty={expected_qty}"
+                    )
+                elif o is None and pos_qty <= 0.0:
+                    # No shares => lot is dead; remove the stale memory.
+                    db_delete_lot(conn, symbol, float(lot["buy_level"]))
+                    log.info(f"🧹 {symbol} reconcile auto-heal: removed stale lot (no position, missing SELL {sell_oid})")
+                else:
+                    log.warning(f"🟠 {symbol} reconcile: sell_open order {sell_oid} not open, truth unknown -> keeping lot")
 
 
 # =======================
