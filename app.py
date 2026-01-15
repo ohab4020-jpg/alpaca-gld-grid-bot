@@ -1,4 +1,4 @@
-# Leo Grid Bot v4.1.1
+# Leo Grid Bot v4.2.0_TRIAL_2026-01-15
 # Minimal fix: BUY-side reconcile fallback uses position truth when Alpaca parent BUY order is missing.
 
 import os
@@ -74,6 +74,16 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # Send daily summary after this UTC hour (0-23). (Example: 20 = 20:00 UTC)
 DAILY_SUMMARY_HOUR_UTC = int(os.getenv("DAILY_SUMMARY_HOUR_UTC", "20"))
+
+# =======================
+# HEALTH / ALERT CONFIG (NEW)
+# =======================
+LOT_STUCK_MINUTES = int(os.getenv("LOT_STUCK_MINUTES", "180"))  # consider lots stuck after this many minutes
+HEALTH_RECENT_ERROR_HOURS = int(os.getenv("HEALTH_RECENT_ERROR_HOURS", "24"))
+HEALTH_RECENT_AUTOHEAL_HOURS = int(os.getenv("HEALTH_RECENT_AUTOHEAL_HOURS", "24"))
+HEALTH_RECENT_CAPSAT_HOURS = int(os.getenv("HEALTH_RECENT_CAPSAT_HOURS", "6"))
+HEALTH_ALERT_COOLDOWN_MINUTES = int(os.getenv("HEALTH_ALERT_COOLDOWN_MINUTES", "60"))  # rate-limit health alerts
+
 
 # =======================
 # GLOBAL "ONE ORDER" MODE
@@ -233,6 +243,164 @@ def db_set_state(conn, k: str, v: str) -> None:
             (k, str(v)),
         )
 
+
+
+# =======================
+# HEALTH / EVENTS (NEW)
+# =======================
+def _iso_now() -> str:
+    return now_utc().isoformat()
+
+
+def _parse_iso(ts: str) -> datetime:
+    try:
+        return datetime.fromisoformat(ts)
+    except Exception:
+        return datetime.fromtimestamp(0, tz=timezone.utc)
+
+
+def db_get_state_int(conn, k: str, default: int = 0) -> int:
+    raw = db_get_state(conn, k, "")
+    try:
+        return int(raw)
+    except Exception:
+        return int(default)
+
+
+def db_get_state_float(conn, k: str, default: float = 0.0) -> float:
+    raw = db_get_state(conn, k, "")
+    try:
+        return float(raw)
+    except Exception:
+        return float(default)
+
+
+def db_inc_state(conn, k: str, delta: int = 1) -> int:
+    curr = db_get_state_int(conn, k, 0)
+    curr += int(delta)
+    db_set_state(conn, k, str(curr))
+    return curr
+
+
+def _recent_within_hours(ts_iso: str, hours: int) -> bool:
+    if not ts_iso:
+        return False
+    try:
+        t = _parse_iso(ts_iso)
+        return (now_utc() - t) <= timedelta(hours=float(hours))
+    except Exception:
+        return False
+
+
+def record_auto_heal(conn, symbol: str, detail: str) -> None:
+    db_inc_state(conn, "health:auto_heal_count", 1)
+    db_set_state(conn, "health:auto_heal_last_ts", _iso_now())
+    db_set_state(conn, "health:auto_heal_last", f"{symbol}:{detail}")
+
+
+def record_capital_saturation(conn, symbol: str, detail: str) -> None:
+    db_inc_state(conn, "health:cap_sat_count", 1)
+    db_set_state(conn, "health:cap_sat_last_ts", _iso_now())
+    db_set_state(conn, "health:cap_sat_last", f"{symbol}:{detail}")
+
+
+def record_error(conn, detail: str) -> None:
+    db_inc_state(conn, "health:error_count", 1)
+    db_set_state(conn, "health:error_last_ts", _iso_now())
+    db_set_state(conn, "health:error_last", str(detail)[:500])
+
+
+def detect_stuck_lots(conn, minutes: int):
+    mins = int(minutes)
+    if mins <= 0:
+        return []
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT symbol, buy_level, sell_level, qty, state, updated_at
+            FROM grid_lots
+            WHERE state IN ('buy_open', 'sell_open')
+              AND updated_at < (now() - (%s * interval '1 minute'))
+            ORDER BY updated_at ASC;
+            """,
+            (mins,),
+        )
+        return cur.fetchall() or []
+
+
+def maybe_alert_lot_stuck(conn) -> None:
+    try:
+        stuck = detect_stuck_lots(conn, LOT_STUCK_MINUTES)
+        if not stuck:
+            return
+
+        last_alert_ts = db_get_state(conn, "health:lot_stuck_alert_ts", "")
+        cooldown_hours = max(1, int(HEALTH_ALERT_COOLDOWN_MINUTES / 60))
+        if last_alert_ts and _recent_within_hours(last_alert_ts, cooldown_hours):
+            return
+
+        db_inc_state(conn, "health:lot_stuck_count", len(stuck))
+        db_set_state(conn, "health:lot_stuck_last_ts", _iso_now())
+        db_set_state(conn, "health:lot_stuck_last", f"{stuck[0]['symbol']}:{stuck[0]['state']}")
+
+        top = stuck[:5]
+        lines = ["2️⃣ 🕒 Lot stuck — needs attention"]
+        for r in top:
+            try:
+                age_min = int((now_utc() - r["updated_at"]).total_seconds() / 60)
+            except Exception:
+                age_min = -1
+            lines.append(
+                f"{r['symbol']} {r['state']} | buy={float(r['buy_level']):.2f} sell={float(r['sell_level']):.2f} qty={float(r['qty']):g} | age≈{age_min}m"
+            )
+        if len(stuck) > len(top):
+            lines.append(f"...and {len(stuck) - len(top)} more")
+
+        tg_send("\n".join(lines))
+        db_set_state(conn, "health:lot_stuck_alert_ts", _iso_now())
+    except Exception as e:
+        log.warning(f"lot-stuck check failed: {e}")
+
+
+def total_pnl_since_start(conn) -> float:
+    equity = get_account_equity()
+    start = db_get_state_float(conn, "health:start_equity", 0.0)
+    if start <= 0.0:
+        db_set_state(conn, "health:start_equity", str(float(equity)))
+        return 0.0
+    return float(equity) - float(start)
+
+
+def compute_confidence_score(conn) -> int:
+    score = 100
+
+    err_ts = db_get_state(conn, "health:error_last_ts", "")
+    if _recent_within_hours(err_ts, HEALTH_RECENT_ERROR_HOURS):
+        score -= 50
+
+    cap_ts = db_get_state(conn, "health:cap_sat_last_ts", "")
+    if _recent_within_hours(cap_ts, HEALTH_RECENT_CAPSAT_HOURS):
+        score -= 15
+
+    ah_ts = db_get_state(conn, "health:auto_heal_last_ts", "")
+    if _recent_within_hours(ah_ts, HEALTH_RECENT_AUTOHEAL_HOURS):
+        score -= 5
+
+    try:
+        stuck = detect_stuck_lots(conn, LOT_STUCK_MINUTES)
+        if stuck:
+            score -= 20
+    except Exception:
+        pass
+
+    if score < 0:
+        score = 0
+    if score > 100:
+        score = 100
+
+    db_set_state(conn, "health:confidence_last", str(int(score)))
+    db_set_state(conn, "health:confidence_last_ts", _iso_now())
+    return int(score)
 
 # =======================
 # DAILY WINS HELPERS (NEW)
@@ -857,6 +1025,10 @@ def reconcile_lots(conn, symbol: str, open_orders):
                     )
 
                 log.info(f"🧠 {symbol} reconcile fallback: BUY assumed filled via position qty={expected_qty}")
+                try:
+                    record_auto_heal(conn, symbol, 'buy_position_fallback')
+                except Exception:
+                    pass
 
             else:
                 log.warning(f"🟠 {symbol} reconcile: buy_open order {buy_oid} not open, truth unknown -> keeping lot")
@@ -964,10 +1136,18 @@ def reconcile_lots(conn, symbol: str, open_orders):
                     log.info(
                         f"🧠 {symbol} reconcile auto-heal: phantom SELL {sell_oid} cleared via position qty={expected_qty}"
                     )
+                    try:
+                        record_auto_heal(conn, symbol, 'phantom_sell_cleared')
+                    except Exception:
+                        pass
                 elif o is None and pos_qty <= 0.0:
                     # No shares => lot is dead; remove the stale memory.
                     db_delete_lot(conn, symbol, float(lot["buy_level"]))
                     log.info(f"🧹 {symbol} reconcile auto-heal: removed stale lot (no position, missing SELL {sell_oid})")
+                    try:
+                        record_auto_heal(conn, symbol, 'stale_lot_removed')
+                    except Exception:
+                        pass
                 else:
                     log.warning(f"🟠 {symbol} reconcile: sell_open order {sell_oid} not open, truth unknown -> keeping lot")
 
@@ -1086,6 +1266,10 @@ def run_symbol(conn, symbol: str, cfg: dict, allow_new_order: bool = True):
         msg = f"⚠️ {symbol} config invalid: lower({lower}) must be < upper({upper})"
         log.error(msg)
         tg_send(msg)
+        try:
+            record_error(conn, msg)
+        except Exception:
+            pass
         return finish({"symbol": symbol, "action": "error", "reason": "bad_config"})
 
     last_price = get_last_price(symbol)
@@ -1133,6 +1317,10 @@ def run_symbol(conn, symbol: str, cfg: dict, allow_new_order: bool = True):
 
     if not can_place:
         log.info(f"🧊 {symbol} new orders blocked (global/rate limit mode)")
+        try:
+            record_capital_saturation(conn, symbol, 'lock_rules')
+        except Exception:
+            pass
         return finish({"symbol": symbol, "action": "none", "reason": "new_orders_blocked", "price": last_price}, last_price)
 
     # =========================
@@ -1165,6 +1353,10 @@ def run_symbol(conn, symbol: str, cfg: dict, allow_new_order: bool = True):
                     msg = f"❌ SELL failed | {symbol} | {e}"
                     log.error(msg)
                     tg_send(msg)
+                    try:
+                        record_error(conn, msg)
+                    except Exception:
+                        pass
                     return finish({"symbol": symbol, "action": "error", "reason": "sell_failed"}, last_price)
 
     # =========================
@@ -1183,6 +1375,19 @@ def run_symbol(conn, symbol: str, cfg: dict, allow_new_order: bool = True):
         projected = used + (buy_qty * float(buy_level))
         if projected > max_capital:
             log.info(f"🟠 {symbol} BUY blocked (capital) used≈${used:,.2f} projected≈${projected:,.2f} max=${max_capital:,.2f}")
+            try:
+                record_capital_saturation(conn, symbol, f"capital used≈{used:.2f} projected≈{projected:.2f} max≈{max_capital:.2f}")
+            except Exception:
+                pass
+            # alert (rate-limited)
+            try:
+                last_alert_ts = db_get_state(conn, "health:cap_sat_alert_ts", "")
+                cooldown_hours = max(1, int(HEALTH_ALERT_COOLDOWN_MINUTES / 60))
+                if (not last_alert_ts) or (not _recent_within_hours(last_alert_ts, cooldown_hours)):
+                    tg_send(f"3️⃣ 🧊 Capital saturation | {symbol}\nused≈${used:,.2f} projected≈${projected:,.2f} max=${max_capital:,.2f}")
+                    db_set_state(conn, "health:cap_sat_alert_ts", _iso_now())
+            except Exception:
+                pass
             return finish({"symbol": symbol, "action": "none", "reason": "max_capital", "used": used, "price": last_price}, last_price)
 
         sell_target = next_level_above(levels, float(buy_level))
@@ -1237,6 +1442,10 @@ def run_symbol(conn, symbol: str, cfg: dict, allow_new_order: bool = True):
                 msg = f"❌ BUY failed | {symbol} | {e}"
                 log.error(msg)
                 tg_send(msg)
+                try:
+                    record_error(conn, msg)
+                except Exception:
+                    pass
                 return finish({"symbol": symbol, "action": "error", "reason": "buy_failed"}, last_price)
 
     if TOUCH_MODE and prev_price is None:
@@ -1283,6 +1492,10 @@ def run():
             if res.get("action") in ("buy", "sell"):
                 new_orders_left -= 1
 
+        # health checks (NEW)
+        maybe_alert_lot_stuck(conn)
+        compute_confidence_score(conn)
+
         maybe_daily_summary(conn)
 
         conn.commit()
@@ -1292,6 +1505,11 @@ def run():
         msg = f"❌ /run crashed: {e}"
         log.exception(msg)
         tg_send(msg)
+        try:
+            record_error(conn, msg)
+            conn.commit()
+        except Exception:
+            pass
         return jsonify({"status": "error", "error": str(e)}), 500
     finally:
         try:
@@ -1308,6 +1526,35 @@ def board():
         return "Unauthorized", 401
 
     lines = [f"🦁 Leo Board | Paper={PAPER} | TradingEnabled={TRADING_ENABLED} | {now_utc().isoformat()}"]
+    # health snapshot (NEW)
+    try:
+        conn = pg_conn()
+        try:
+            score = compute_confidence_score(conn)
+            pnl_total = total_pnl_since_start(conn)
+            err_last = db_get_state(conn, "health:error_last", "")
+            cap_last = db_get_state(conn, "health:cap_sat_last", "")
+            ah_last = db_get_state(conn, "health:auto_heal_last", "")
+            stuck_now = detect_stuck_lots(conn, LOT_STUCK_MINUTES)
+            lines.append(f"5️⃣ 🧠 Confidence: {score}/100")
+            lines.append(f"6️⃣ 📊 Total P/L (since start): ${pnl_total:,.2f}")
+            if stuck_now:
+                lines.append(f"2️⃣ 🕒 Lot stuck: {len(stuck_now)} (>{LOT_STUCK_MINUTES}m)")
+            if cap_last:
+                lines.append(f"3️⃣ 🧊 Capital saturation: {cap_last}")
+            if ah_last:
+                lines.append(f"1️⃣ 🧠 Auto-heal: {ah_last}")
+            if err_last:
+                lines.append(f"4️⃣ 🚨 Error: {err_last}")
+            conn.close()
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     try:
         global_open = get_all_open_orders()
         lines.append(f"📌 Open orders (global): {len(global_open)}")
@@ -1339,6 +1586,35 @@ def telegram_webhook():
 
         if msg.strip().lower() == "/status":
             lines = [f"🦁 Leo status | Paper={PAPER} | TradingEnabled={TRADING_ENABLED} | SL_PCT={STOP_LOSS_PCT:.2%}"]
+            # health snapshot (NEW)
+            try:
+                conn = pg_conn()
+                try:
+                    score = compute_confidence_score(conn)
+                    pnl_total = total_pnl_since_start(conn)
+                    err_last = db_get_state(conn, "health:error_last", "")
+                    cap_last = db_get_state(conn, "health:cap_sat_last", "")
+                    ah_last = db_get_state(conn, "health:auto_heal_last", "")
+                    stuck_now = detect_stuck_lots(conn, LOT_STUCK_MINUTES)
+                    lines.append(f"5️⃣ 🧠 Confidence: {score}/100")
+                    lines.append(f"6️⃣ 📊 Total P/L (since start): ${pnl_total:,.2f}")
+                    if stuck_now:
+                        lines.append(f"2️⃣ 🕒 Lot stuck: {len(stuck_now)} (>{LOT_STUCK_MINUTES}m)")
+                    if cap_last:
+                        lines.append(f"3️⃣ 🧊 Capital saturation: {cap_last}")
+                    if ah_last:
+                        lines.append(f"1️⃣ 🧠 Auto-heal: {ah_last}")
+                    if err_last:
+                        lines.append(f"4️⃣ 🚨 Error: {err_last}")
+                    conn.close()
+                except Exception:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
             for sym, cfg in BOTS.items():
                 p = get_last_price(sym)
                 pos = get_position_qty(sym)
