@@ -1,9 +1,27 @@
-# Leo Grid Bot v4.2.0_TRIAL_2026-01-15
-# Minimal fix: BUY-side reconcile fallback uses position truth when Alpaca parent BUY order is missing.
+# Leo Grid Bot v4.2.1_PATCH_2026-01-16
+# Updates in this patched version:
+#   1) Live-mode hardening:
+#        - RUN_TOKEN is REQUIRED when PAPER_TRADING=false (live)
+#        - /board also requires token in live
+#        - Live-mode file logging to Render Disk (/var/data by default)
+#   2) Logging:
+#        - Stream + Rotating file logs (when enabled)
+#        - More detailed reconcile + order lifecycle logs
+#   3) DB initialization/migrations:
+#        - Adds ALTER TABLE ... ADD COLUMN IF NOT EXISTS for all known columns
+#   4) Reconcile logic:
+#        - Safer BUY "position-truth" fallback: only promotes when there is enough
+#          *untracked* position qty for that lot, and only once per run per symbol.
+#   5) Stop-loss default widened to 60% (STOP_LOSS_PCT default = 0.60)
+#
+# Notes:
+#   - Per-symbol max_capital is preserved (no global account cap added).
+#   - This bot uses Alpaca bracket orders: BUY parent + TP limit sell + SL stop.
 
 import os
 import math
 import logging
+from logging.handlers import RotatingFileHandler
 from datetime import datetime, timezone, date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 
@@ -39,13 +57,6 @@ from alpaca.data.requests import StockLatestTradeRequest
 
 
 # =======================
-# LOGGING
-# =======================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("leo")
-
-
-# =======================
 # CONFIG (EDIT THIS)
 # =======================
 BOTS = {
@@ -55,10 +66,11 @@ BOTS = {
 
 MIN_TICK = 0.01  # 🔒 minimum price difference to avoid buy/sell at same level
 
+
 # =======================
 # QTY PRECISION / FRACTIONALS
 # =======================
-# Decision (as requested):
+# Decision:
 #   - BUY: whole shares only (stable grid sizing)
 #   - SELL: allow fractional (handles partial fills / seeded positions that may become fractional)
 BUY_WHOLE_SHARES = os.getenv("BUY_WHOLE_SHARES", "true").lower() == "true"
@@ -68,48 +80,102 @@ ALLOW_FRACTIONAL_SELLS = os.getenv("ALLOW_FRACTIONAL_SELLS", "true").lower() == 
 QTY_STEP = Decimal(os.getenv("QTY_STEP", "0.0001"))
 
 
+# =======================
+# ENV / MODES
+# =======================
 PAPER = os.getenv("PAPER_TRADING", "true").lower() == "true"
 TRADING_ENABLED = os.getenv("TRADING_ENABLED", "true").lower() == "true"
 
-RUN_TOKEN = os.getenv("RUN_TOKEN", "")  # required header X-RUN-TOKEN
-DATABASE_URL = os.getenv("DATABASE_URL")  # from Render Postgres
+# Required header X-RUN-TOKEN for /run (and /board in live)
+RUN_TOKEN = os.getenv("RUN_TOKEN", "")
 
+# Render Postgres connection string
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+# Telegram
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # Send daily summary after this UTC hour (0-23). (Example: 20 = 20:00 UTC)
 DAILY_SUMMARY_HOUR_UTC = int(os.getenv("DAILY_SUMMARY_HOUR_UTC", "20"))
 
+
 # =======================
-# HEALTH / ALERT CONFIG (NEW)
+# HEALTH / ALERT CONFIG
 # =======================
-LOT_STUCK_MINUTES = int(os.getenv("LOT_STUCK_MINUTES", "180"))  # consider lots stuck after this many minutes
+LOT_STUCK_MINUTES = int(os.getenv("LOT_STUCK_MINUTES", "180"))
 HEALTH_RECENT_ERROR_HOURS = int(os.getenv("HEALTH_RECENT_ERROR_HOURS", "24"))
 HEALTH_RECENT_AUTOHEAL_HOURS = int(os.getenv("HEALTH_RECENT_AUTOHEAL_HOURS", "24"))
 HEALTH_RECENT_CAPSAT_HOURS = int(os.getenv("HEALTH_RECENT_CAPSAT_HOURS", "6"))
-HEALTH_ALERT_COOLDOWN_MINUTES = int(os.getenv("HEALTH_ALERT_COOLDOWN_MINUTES", "60"))  # rate-limit health alerts
+HEALTH_ALERT_COOLDOWN_MINUTES = int(os.getenv("HEALTH_ALERT_COOLDOWN_MINUTES", "60"))
 
 
 # =======================
-# GLOBAL "ONE ORDER" MODE
+# GLOBAL "ONE ORDER" MODE (kept)
 # =======================
 GLOBAL_ONE_ORDER_AT_A_TIME = os.getenv("GLOBAL_ONE_ORDER_AT_A_TIME", "false").lower() == "true"
 MAX_NEW_ORDERS_PER_RUN = int(os.getenv("MAX_NEW_ORDERS_PER_RUN", "1"))
+
 
 # =======================
 # BUY/SELL ON TOUCH (CROSSING) MODE
 # =======================
 TOUCH_MODE = os.getenv("TOUCH_MODE", "true").lower() == "true"
 
+
 # =======================
-# WIDE STOP LOSS CONFIG (AUTOMATED)
+# WIDE STOP LOSS CONFIG (DEFAULT NOW 60%)
 # =======================
 # This sets the stop-loss *below* the buy price by a percentage.
-# Example: STOP_LOSS_PCT=0.35 means stop at 35% below the buy (very wide).
-STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.35"))
-# Optional extra guard: never set stop above this fraction of lower band (keeps stop from being too high in some edge cases)
+# Example: STOP_LOSS_PCT=0.60 means stop at 60% below the buy (very wide).
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.60"))
+
+# Optional extra guard: never set stop above this fraction of lower band
 # If unset/empty, ignored.
 STOP_LOSS_MIN_FACTOR_OF_LOWER = os.getenv("STOP_LOSS_MIN_FACTOR_OF_LOWER", "").strip()
+
+
+# =======================
+# LOGGING (Render Disk)
+# =======================
+# Render Persistent Disk commonly mounts at /var/data.
+# Set LOG_DIR to your disk path (Render: /var/data) to persist logs across deploys.
+LOG_DIR = os.getenv("LOG_DIR", "/var/data")
+LOG_TO_FILE = os.getenv("LOG_TO_FILE", "true").lower() == "true"
+LOG_FILE_NAME = os.getenv("LOG_FILE_NAME", "leo_grid_bot.log")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+
+def _configure_logging() -> logging.Logger:
+    logger = logging.getLogger("leo")
+    logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+    logger.handlers.clear()
+
+    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+
+    # Always log to stdout (Render captures this)
+    sh = logging.StreamHandler()
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+
+    # In LIVE mode, we strongly prefer file logs as well.
+    if LOG_TO_FILE and (not PAPER or os.getenv("FORCE_FILE_LOG", "false").lower() == "true"):
+        try:
+            os.makedirs(LOG_DIR, exist_ok=True)
+            fp = os.path.join(LOG_DIR, LOG_FILE_NAME)
+            fh = RotatingFileHandler(fp, maxBytes=5_000_000, backupCount=5)
+            fh.setFormatter(fmt)
+            logger.addHandler(fh)
+            logger.info(f"📝 File logging enabled: {fp}")
+        except Exception as e:
+            # Do not crash for logging issues; fall back to stdout.
+            logger.warning(f"File logging could not be enabled: {e}")
+
+    logger.propagate = False
+    return logger
+
+
+log = _configure_logging()
 
 
 # =======================
@@ -124,6 +190,10 @@ if not ALPACA_KEY or not ALPACA_SECRET:
 if not DATABASE_URL:
     raise RuntimeError("Missing DATABASE_URL. Add Render Postgres and connect it to this service.")
 
+# ✅ Force RUN_TOKEN in LIVE mode
+if not PAPER and not RUN_TOKEN:
+    raise RuntimeError("LIVE mode detected (PAPER_TRADING=false) but RUN_TOKEN is missing. Set RUN_TOKEN before going live.")
+
 trading = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=PAPER)
 data_client = StockHistoricalDataClient(ALPACA_KEY, ALPACA_SECRET)
 
@@ -133,6 +203,7 @@ app = Flask(__name__)
 # =======================
 # SMALL UTILITIES
 # =======================
+
 def d2(x: float) -> float:
     """Round price to 2 decimals."""
     return float(Decimal(str(x)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
@@ -142,10 +213,9 @@ def normalize_qty(qty: float, *, allow_fractional: bool) -> float:
     """Normalize quantity for order submission.
 
     - If allow_fractional=False: return whole shares (floor) and never negative.
-    - If allow_fractional=True: quantize to QTY_STEP.
+    - If allow_fractional=True: quantize DOWN to QTY_STEP.
 
-    Returns a float suitable for alpaca-py (alpaca-py accepts float/str/Decimal depending on version;
-    we keep float here for minimal disruption).
+    Important: we always round DOWN to avoid over-selling.
     """
     try:
         q = Decimal(str(qty))
@@ -156,11 +226,9 @@ def normalize_qty(qty: float, *, allow_fractional: bool) -> float:
         return 0.0
 
     if not allow_fractional:
-        # Whole shares only
         return float(int(q))
 
     step = QTY_STEP if QTY_STEP > 0 else Decimal("0.0001")
-    # Quantize DOWN to step to avoid over-selling.
     q = (q / step).to_integral_value(rounding="ROUND_FLOOR") * step
     return float(q)
 
@@ -194,8 +262,9 @@ def pg_conn():
 
 
 # =======================
-# POSTGRES INIT
+# POSTGRES INIT + MIGRATIONS
 # =======================
+
 def init_db():
     conn = pg_conn()
     try:
@@ -208,6 +277,7 @@ def init_db():
                 );
             """
             )
+
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS daily_equity (
@@ -217,7 +287,7 @@ def init_db():
                 );
             """
             )
-            # ✅ NEW: daily wins summary (count + pnl)
+
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS daily_wins (
@@ -228,6 +298,7 @@ def init_db():
                 );
             """
             )
+
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS grid_lots (
@@ -237,8 +308,6 @@ def init_db():
                     qty NUMERIC NOT NULL,
                     state TEXT NOT NULL, -- buy_open | owned | sell_open
                     buy_order_id TEXT,
-                    -- For bracket orders we store BOTH child legs (TP + SL). For non-bracket sells,
-                    -- we keep using sell_order_id.
                     sell_order_id TEXT,
                     tp_order_id TEXT,
                     sl_order_id TEXT,
@@ -248,12 +317,23 @@ def init_db():
             """
             )
 
-            # Backwards-compatible migrations for existing databases
+            # ✅ Backwards-compatible migrations for existing databases
+            # (CREATE TABLE IF NOT EXISTS does NOT add missing columns.)
+            cur.execute("ALTER TABLE grid_lots ADD COLUMN IF NOT EXISTS buy_order_id TEXT;")
+            cur.execute("ALTER TABLE grid_lots ADD COLUMN IF NOT EXISTS sell_order_id TEXT;")
             cur.execute("ALTER TABLE grid_lots ADD COLUMN IF NOT EXISTS tp_order_id TEXT;")
             cur.execute("ALTER TABLE grid_lots ADD COLUMN IF NOT EXISTS sl_order_id TEXT;")
+            cur.execute("ALTER TABLE grid_lots ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();")
+
+            # If someone created a minimal grid_lots table, ensure required columns exist.
+            cur.execute("ALTER TABLE grid_lots ADD COLUMN IF NOT EXISTS symbol TEXT;")
+            cur.execute("ALTER TABLE grid_lots ADD COLUMN IF NOT EXISTS buy_level NUMERIC;")
+            cur.execute("ALTER TABLE grid_lots ADD COLUMN IF NOT EXISTS sell_level NUMERIC;")
+            cur.execute("ALTER TABLE grid_lots ADD COLUMN IF NOT EXISTS qty NUMERIC;")
+            cur.execute("ALTER TABLE grid_lots ADD COLUMN IF NOT EXISTS state TEXT;")
 
         conn.commit()
-        log.info("✅ Postgres initialized")
+        log.info("✅ Postgres initialized + migrations applied")
     finally:
         conn.close()
 
@@ -261,6 +341,7 @@ def init_db():
 # =======================
 # BOT STATE HELPERS
 # =======================
+
 def db_get_state(conn, k: str, default: str = "") -> str:
     try:
         with conn.cursor() as cur:
@@ -284,10 +365,10 @@ def db_set_state(conn, k: str, v: str) -> None:
         )
 
 
+# =======================
+# HEALTH / EVENTS
+# =======================
 
-# =======================
-# HEALTH / EVENTS (NEW)
-# =======================
 def _iso_now() -> str:
     return now_utc().isoformat()
 
@@ -433,20 +514,17 @@ def compute_confidence_score(conn) -> int:
     except Exception:
         pass
 
-    if score < 0:
-        score = 0
-    if score > 100:
-        score = 100
-
+    score = max(0, min(100, score))
     db_set_state(conn, "health:confidence_last", str(int(score)))
     db_set_state(conn, "health:confidence_last_ts", _iso_now())
     return int(score)
 
+
 # =======================
-# DAILY WINS HELPERS (NEW)
+# DAILY WINS HELPERS
 # =======================
+
 def db_record_tp_win(conn, day: date, pnl_usd: float) -> None:
-    """Accumulate TP wins and TP PnL for the day (UTC)."""
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -474,6 +552,7 @@ def db_mark_daily_wins_sent(conn, day: date) -> None:
 # =======================
 # GLOBAL RUN LOCK
 # =======================
+
 def acquire_global_lock(conn) -> bool:
     lock_key = 99112233
     with conn.cursor() as cur:
@@ -490,6 +569,7 @@ def release_global_lock(conn) -> None:
 # =======================
 # PRICE + ACCOUNT
 # =======================
+
 def get_last_price(symbol: str) -> float:
     req = StockLatestTradeRequest(symbol_or_symbols=symbol)
     trade = data_client.get_stock_latest_trade(req)[symbol]
@@ -529,8 +609,9 @@ def get_recent_closed_orders(symbol: str, days: int = 14):
 
 
 # =======================
-# GLOBAL OPEN ORDERS + STRONGER ORDER LOOKUP
+# GLOBAL OPEN ORDERS + ORDER LOOKUP
 # =======================
+
 def get_all_open_orders():
     try:
         req = GetOrdersRequest(status=QueryOrderStatus.OPEN)
@@ -573,7 +654,6 @@ def order_filled_qty(order_obj) -> float:
 
 
 def order_filled_avg_price(order_obj) -> float:
-    """Best-effort filled average price from Alpaca order object."""
     try:
         p = getattr(order_obj, "filled_avg_price", None)
         if p is None or p == "":
@@ -584,16 +664,11 @@ def order_filled_avg_price(order_obj) -> float:
 
 
 # =======================
-# TP/SL CLASSIFIER (NEW)
+# TP/SL CLASSIFIER
 # =======================
+
 def classify_sell_fill(order_obj) -> str:
-    """
-    Classifies a filled SELL leg.
-    Returns:
-      'tp' -> take-profit filled (usually LIMIT sell)
-      'sl' -> stop-loss triggered (STOP / STOP_LIMIT)
-      'sell' -> normal/unknown sell
-    """
+    """Return 'tp' for limit sells, 'sl' for stop sells, else 'sell'."""
     try:
         typ = str(getattr(order_obj, "type", "") or "").lower()
         if "stop" in typ:
@@ -608,6 +683,7 @@ def classify_sell_fill(order_obj) -> str:
 # =======================
 # GRID (GEOMETRIC)
 # =======================
+
 def build_geometric_levels(lower: float, upper: float, grid_pct: float):
     if lower <= 0 or upper <= 0 or grid_pct <= 0:
         return []
@@ -644,6 +720,7 @@ def next_level_above(levels, level: float):
 # =======================
 # TOUCH/CROSSING HELPERS
 # =======================
+
 def pick_touched_buy_level(levels, prev_price: float, curr_price: float):
     if prev_price is None:
         return None
@@ -671,8 +748,9 @@ def pick_touched_sell_level(levels, prev_price: float, curr_price: float):
 
 
 # =======================
-# CAPITAL RULE
+# CAPITAL RULE (per-symbol)
 # =======================
+
 def capital_used(symbol: str, last_price: float, open_orders):
     pos_qty = get_position_qty(symbol)
     pos_value = pos_qty * last_price
@@ -688,6 +766,7 @@ def capital_used(symbol: str, last_price: float, open_orders):
 # =======================
 # SAFE ORDER PLACEMENT
 # =======================
+
 def has_open_order_at(open_orders, side: str, price: float) -> bool:
     p = d2(price)
     for o in open_orders:
@@ -726,18 +805,9 @@ def place_limit(symbol: str, side: str, qty: float, price: float):
 
 
 def compute_wide_stop_price(buy_price: float, lower_band: float) -> float:
-    """
-    Automated wide stop:
-      stop = buy * (1 - STOP_LOSS_PCT)
-    Plus optional extra guard based on lower band.
-
-    It must be strictly below buy_price (Alpaca requirement).
-    """
+    """Automated wide stop: stop = buy * (1 - STOP_LOSS_PCT), with optional guard."""
     pct = float(STOP_LOSS_PCT)
-    if pct < 0.01:
-        pct = 0.01
-    if pct > 0.95:
-        pct = 0.95
+    pct = min(max(pct, 0.01), 0.95)
 
     stop = buy_price * (1.0 - pct)
 
@@ -760,16 +830,8 @@ def compute_wide_stop_price(buy_price: float, lower_band: float) -> float:
     return stop
 
 
-# ✅ UPDATED: BRACKET BUY (TP + WIDE STOP-LOSS)
 def place_bracket_buy(symbol: str, qty: float, buy_price: float, take_profit_price: float, stop_price: float):
-    """
-    Places one parent BUY limit + two children:
-      - TAKE-PROFIT sell limit
-      - STOP-LOSS sell stop
-
-    Your Alpaca environment requires stop_loss.stop_price for bracket orders.
-    We compute a wide automated stop so it's hard to hit.
-    """
+    """Places parent BUY limit + TP limit + SL stop (bracket)."""
     if not TRADING_ENABLED:
         msg = f"⛔️ TRADING DISABLED | blocked BRACKET BUY {symbol}"
         log.info(msg)
@@ -802,14 +864,7 @@ def place_bracket_buy(symbol: str, qty: float, buy_price: float, take_profit_pri
 
 
 def extract_bracket_leg_ids(order_obj):
-    """Return (tp_leg_id, sl_leg_id) for a BRACKET parent order.
-
-    Alpaca bracket parents commonly include a ``legs`` list. We identify:
-      - take-profit leg: SELL + type == LIMIT
-      - stop-loss leg: SELL + type contains STOP
-
-    Returns empty strings if not found.
-    """
+    """Return (tp_leg_id, sl_leg_id) for a BRACKET parent order."""
     tp_id, sl_id = "", ""
     if not order_obj:
         return tp_id, sl_id
@@ -834,7 +889,6 @@ def extract_bracket_leg_ids(order_obj):
                 if not tp_id:
                     tp_id = leg_id
             else:
-                # Fallback: if we have neither, treat first SELL as TP to preserve old behavior.
                 if not tp_id:
                     tp_id = leg_id
         except Exception:
@@ -844,7 +898,6 @@ def extract_bracket_leg_ids(order_obj):
 
 
 def extract_take_profit_leg_id(order_obj) -> str:
-    """Backward-compatible helper: returns TP leg ID if available."""
     tp_id, _ = extract_bracket_leg_ids(order_obj)
     return tp_id
 
@@ -852,6 +905,7 @@ def extract_take_profit_leg_id(order_obj) -> str:
 # =======================
 # GRID MEMORY (DB HELPERS)
 # =======================
+
 def db_list_lots(conn, symbol: str):
     with conn.cursor() as cur:
         cur.execute("SELECT * FROM grid_lots WHERE symbol=%s;", (symbol,))
@@ -892,7 +946,17 @@ def db_upsert_lot(
                 sl_order_id=COALESCE(EXCLUDED.sl_order_id, grid_lots.sl_order_id),
                 updated_at=now();
         """,
-            (symbol, d2(buy_level), d2(sell_level), float(qty), state, buy_order_id, sell_order_id, tp_order_id, sl_order_id),
+            (
+                symbol,
+                d2(buy_level),
+                d2(sell_level),
+                float(qty),
+                state,
+                buy_order_id,
+                sell_order_id,
+                tp_order_id,
+                sl_order_id,
+            ),
         )
 
 
@@ -920,32 +984,26 @@ def db_get_seeded_lot_for_sell_level(conn, symbol: str, sell_level: float):
 
 
 # =======================
-# ROBUST RECONCILIATION (WITH PARTIAL-FILL + BRACKET-AWARE + TP/SL ALERTS + WIN TRACKING)
+# RECONCILIATION (ROBUST + SAFER BUY FALLBACK)
 # =======================
+
 def reconcile_lots(conn, symbol: str, open_orders):
+    """Reconcile DB lots with Alpaca reality.
+
+    Key behaviors:
+      - When a tracked order is not open, attempt truth lookup by ID, then recent CLOSED.
+      - Partial-fill handling for both buy_open and sell_open.
+      - Bracket-aware: sell_open is treated as "either TP or SL leg may fill".
+
+    Safer BUY fallback (patch):
+      - Only promotes a missing BUY when there is enough *untracked* position qty
+        to justify that specific lot.
+      - Only one fallback promotion per symbol per run.
+
+    This prevents the serious failure mode: symbol has some position (manual/seeded/other lot)
+    and we accidentally "promote" multiple missing buys into owned/sell_open.
     """
-    Robust reconciliation:
-    - If tracked order no longer open:
-        - Prefer fetching by ID (truth)
-        - Else use recent CLOSED list
-        - If still unknown: DO NOT DELETE; keep and warn
 
-    Partial-fill + cancel cases:
-      - buy_open: if filled_qty > 0, becomes owned or sell_open depending on bracket leg existence
-      - sell_open: if partially filled, reduce qty and revert to owned
-
-    ✅ BRACKET-AWARE:
-      - If buy_open order filled, and we can see a TP leg id, we transition straight to sell_open.
-      - If sell_open leg fills, we delete lot as before.
-
-    ✅ NEW:
-      - Telegram alert when TP fills (with PnL)
-      - Telegram alert when SL triggers (with PnL)
-      - Daily wins counter + PnL accumulation for TP fills
-
-    v4.1.1 fix:
-      - If BUY parent order is missing from Alpaca but position exists, assume buy filled and promote lot.
-    """
     open_ids = set()
     for o in open_orders:
         try:
@@ -957,6 +1015,7 @@ def reconcile_lots(conn, symbol: str, open_orders):
     if not lots:
         return
 
+    # Build a lookup of recent closed orders for truth fallback.
     closed = get_recent_closed_orders(symbol)
     closed_by_id = {}
     for o in closed:
@@ -979,6 +1038,21 @@ def reconcile_lots(conn, symbol: str, open_orders):
         except Exception:
             return 0.0
 
+    # Compute "tracked" position qty from lots that represent owned inventory.
+    # - owned: yes
+    # - sell_open: yes (still owned until filled)
+    # buy_open: no (not owned yet)
+    tracked_owned_qty = 0.0
+    for lot in lots:
+        st = str(lot.get("state") or "")
+        if st in ("owned", "sell_open"):
+            tracked_owned_qty += max(0.0, lot_qty_float(lot))
+
+    pos_qty_total = get_position_qty(symbol)
+    untracked_pos_qty = max(0.0, float(pos_qty_total) - float(tracked_owned_qty))
+
+    fallback_promoted = False
+
     for lot in lots:
         state = lot["state"]
         buy_oid = lot.get("buy_order_id")
@@ -987,12 +1061,17 @@ def reconcile_lots(conn, symbol: str, open_orders):
         sl_oid = lot.get("sl_order_id") or ""
 
         # -------------------------
-        # BUY open -> filled/canceled/unknown (WITH partial-fill truth)
+        # BUY open -> filled/canceled/unknown
         # -------------------------
         if state == "buy_open" and buy_oid and str(buy_oid) not in open_ids:
             o = lookup_order_truth(str(buy_oid))
             st = order_status_string(o) if o else ""
             fq = order_filled_qty(o) if o else 0.0
+
+            # Detailed logging (live debugging)
+            log.info(
+                f"🧾 {symbol} reconcile BUY | lot buy_level={float(lot['buy_level']):.2f} | oid={buy_oid} | truth_status={st or 'n/a'} | truth_filled_qty={fq:g}"
+            )
 
             if fq > 0.0:
                 tp_leg_id, sl_leg_id = ("", "")
@@ -1010,12 +1089,11 @@ def reconcile_lots(conn, symbol: str, open_orders):
                         float(fq),
                         "sell_open",
                         buy_order_id=str(buy_oid),
-                        # Backwards-compat: keep sell_order_id pointing at TP when available
                         sell_order_id=str(tp_leg_id) if tp_leg_id else None,
                         tp_order_id=str(tp_leg_id) if tp_leg_id else None,
                         sl_order_id=str(sl_leg_id) if sl_leg_id else None,
                     )
-                    log.info(f"🧠 {symbol} reconcile: BUY filled_qty={fq} -> BRACKET legs detected -> sell_open")
+                    log.info(f"🧠 {symbol} reconcile: BUY partial/filled qty={fq:g} -> BRACKET legs -> sell_open")
                 else:
                     db_upsert_lot(
                         conn,
@@ -1028,7 +1106,7 @@ def reconcile_lots(conn, symbol: str, open_orders):
                         sell_order_id=None,
                     )
                     if st and st != "filled":
-                        log.warning(f"🟠 {symbol} reconcile: BUY {buy_oid} status={st} but filled_qty={fq} -> keeping as owned")
+                        log.warning(f"🟠 {symbol} reconcile: BUY {buy_oid} status={st} but filled_qty={fq:g} -> owned")
 
             elif st == "filled":
                 fallback_qty = lot_qty_float(lot)
@@ -1066,33 +1144,21 @@ def reconcile_lots(conn, symbol: str, open_orders):
 
             elif st in ("canceled", "cancelled", "rejected", "expired"):
                 db_delete_lot(conn, symbol, float(lot["buy_level"]))
+                log.info(f"🧹 {symbol} reconcile: BUY {buy_oid} {st} -> deleted lot")
 
-            # ✅ v4.1.1 FIX: position-truth fallback when Alpaca "forgets" the parent buy
-            elif get_position_qty(symbol) > 0:
+            # ✅ SAFER position-truth fallback
+            elif (not fallback_promoted) and untracked_pos_qty > 0.0:
                 expected_qty = lot_qty_float(lot)
-                if expected_qty <= 0:
-                    expected_qty = get_position_qty(symbol)
+                # If expected is missing/zero, use a conservative amount: ALL remaining untracked.
+                if expected_qty <= 0.0:
+                    expected_qty = float(untracked_pos_qty)
 
-                tp_leg_id, sl_leg_id = ("", "")
-                try:
-                    tp_leg_id, sl_leg_id = extract_bracket_leg_ids(o)
-                except Exception:
-                    tp_leg_id, sl_leg_id = ("", "")
-
-                if tp_leg_id or sl_leg_id:
-                    db_upsert_lot(
-                        conn,
-                        symbol,
-                        float(lot["buy_level"]),
-                        float(lot["sell_level"]),
-                        float(expected_qty),
-                        "sell_open",
-                        buy_order_id=str(buy_oid),
-                        sell_order_id=str(tp_leg_id) if tp_leg_id else None,
-                        tp_order_id=str(tp_leg_id) if tp_leg_id else None,
-                        sl_order_id=str(sl_leg_id) if sl_leg_id else None,
-                    )
-                else:
+                # Promote only if there is enough untracked position to cover this lot.
+                # Use a tiny tolerance for float/rounding.
+                tol = 1e-6
+                if float(untracked_pos_qty) + tol >= float(expected_qty):
+                    # We cannot reliably fetch legs if the parent is missing; treat as owned.
+                    # (If legs exist, a later reconcile when Alpaca returns the parent/legs will advance it.)
                     db_upsert_lot(
                         conn,
                         symbol,
@@ -1102,25 +1168,33 @@ def reconcile_lots(conn, symbol: str, open_orders):
                         "owned",
                         buy_order_id=str(buy_oid),
                         sell_order_id=None,
+                        tp_order_id=None,
+                        sl_order_id=None,
                     )
 
-                log.info(f"🧠 {symbol} reconcile fallback: BUY assumed filled via position qty={expected_qty}")
-                try:
-                    record_auto_heal(conn, symbol, 'buy_position_fallback')
-                except Exception:
-                    pass
+                    untracked_pos_qty = max(0.0, float(untracked_pos_qty) - float(expected_qty))
+                    fallback_promoted = True
+
+                    log.info(
+                        f"🧠 {symbol} reconcile fallback: BUY parent missing; promoted ONE lot via untracked position qty={expected_qty:g} (remaining_untracked={untracked_pos_qty:g})"
+                    )
+                    try:
+                        record_auto_heal(conn, symbol, "buy_position_fallback_safe")
+                    except Exception:
+                        pass
+                else:
+                    log.warning(
+                        f"🟠 {symbol} reconcile: BUY parent missing; NOT promoting lot (expected={expected_qty:g} > untracked_pos={untracked_pos_qty:g}). Keeping as buy_open."
+                    )
 
             else:
-                log.warning(f"🟠 {symbol} reconcile: buy_open order {buy_oid} not open, truth unknown -> keeping lot")
+                log.warning(
+                    f"🟠 {symbol} reconcile: buy_open order {buy_oid} not open, truth unknown -> keeping lot"
+                )
 
-        # -------------------------
-        # SELL open -> filled/canceled/unknown (WITH partial-fill truth) + TP/SL ALERTS
-        # -------------------------
         # -------------------------
         # SELL open -> filled/canceled/unknown (BRACKET-AWARE: TP vs SL)
         # -------------------------
-        # If we stored bracket legs, we treat the lot as "sell_open" while EITHER leg is open.
-        # Once both legs are no longer open, we determine which leg filled (TP vs SL).
         tracked_sell_ids = []
         if tp_oid or sl_oid:
             if tp_oid:
@@ -1133,18 +1207,16 @@ def reconcile_lots(conn, symbol: str, open_orders):
         any_leg_open = any((oid and str(oid) in open_ids) for oid in tracked_sell_ids)
 
         if state == "sell_open" and tracked_sell_ids and not any_leg_open:
-            # Prefer a filled leg if we can find one.
+            # Look up leg truths
             leg_truth = []
             for oid in tracked_sell_ids:
                 oo = lookup_order_truth(str(oid))
                 leg_truth.append((oid, oo, order_status_string(oo) if oo else "", order_filled_qty(oo) if oo else 0.0))
 
             filled_leg = next((t for t in leg_truth if t[2] == "filled"), None)
-            # If none says filled but some has filled_qty > 0, treat that as the one to process.
             if filled_leg is None:
                 filled_leg = next((t for t in leg_truth if (t[3] or 0.0) > 0.0), None)
 
-            # If still nothing, fall back to first leg.
             oid_used, o, st, fq = ("", None, "", 0.0)
             if filled_leg is not None:
                 oid_used, o, st, fq = filled_leg
@@ -1155,10 +1227,12 @@ def reconcile_lots(conn, symbol: str, open_orders):
             fq = order_filled_qty(o) if o else 0.0
             lot_qty = lot_qty_float(lot)
 
+            log.info(
+                f"🧾 {symbol} reconcile SELL | lot buy_level={float(lot['buy_level']):.2f} | tracked={tracked_sell_ids} | used={oid_used} | truth_status={st or 'n/a'} | truth_filled_qty={fq:g}"
+            )
+
             if st == "filled":
-                # ✅ classify TP vs SL:
-                # - If we tracked both legs, use which id filled as primary signal.
-                # - Else fall back to order type (stop vs limit).
+                # classify TP vs SL
                 if tp_oid or sl_oid:
                     if sl_oid and str(oid_used) == str(sl_oid):
                         fill_type = "sl"
@@ -1175,7 +1249,6 @@ def reconcile_lots(conn, symbol: str, open_orders):
 
                 filled_px = order_filled_avg_price(o)
                 sell_px = float(filled_px) if filled_px > 0 else float(target_level)
-
                 pnl = (sell_px - buy_level) * qty
 
                 if fill_type == "tp":
@@ -1188,8 +1261,6 @@ def reconcile_lots(conn, symbol: str, open_orders):
                     )
                     tg_send(msg)
                     log.info(msg.replace("\n", " | "))
-
-                    # record win stats (UTC day)
                     db_record_tp_win(conn, utc_day(), pnl)
 
                 elif fill_type == "sl":
@@ -1206,6 +1277,7 @@ def reconcile_lots(conn, symbol: str, open_orders):
                 else:
                     msg = f"ℹ️ SELL FILLED | {symbol}\nQty: {qty:g}\nExit: {sell_px:.2f}\nPnL: ${pnl:,.2f}"
                     tg_send(msg)
+                    log.info(msg.replace("\n", " | "))
 
                 db_delete_lot(conn, symbol, float(lot["buy_level"]))
 
@@ -1226,8 +1298,10 @@ def reconcile_lots(conn, symbol: str, open_orders):
                         tp_order_id=None,
                         sl_order_id=None,
                     )
-                if st and st not in ("filled",):
-                    log.warning(f"🟠 {symbol} reconcile: SELL {oid_used} status={st} but filled_qty={fq} -> adjusted remaining={remaining}")
+                if st and st != "filled":
+                    log.warning(
+                        f"🟠 {symbol} reconcile: SELL {oid_used} status={st} but filled_qty={fq:g} -> adjusted remaining={remaining:g}"
+                    )
 
             elif st in ("canceled", "cancelled", "rejected", "expired"):
                 db_upsert_lot(
@@ -1242,11 +1316,9 @@ def reconcile_lots(conn, symbol: str, open_orders):
                     tp_order_id=None,
                     sl_order_id=None,
                 )
+                log.info(f"🧠 {symbol} reconcile: SELL legs {tracked_sell_ids} {st} -> owned")
 
             else:
-                # ✅ AUTO-HEAL: trust positions over assumptions.
-                # If Alpaca cannot find the SELL leg anywhere (not open, not closed),
-                # but we still own shares, the stored sell_open is a phantom and should be cleared.
                 pos_qty = get_position_qty(symbol)
                 if o is None and pos_qty > 0.0:
                     expected_qty = float(lot_qty) if float(lot_qty) > 0.0 else float(pos_qty)
@@ -1263,27 +1335,31 @@ def reconcile_lots(conn, symbol: str, open_orders):
                         sl_order_id=None,
                     )
                     log.info(
-                        f"🧠 {symbol} reconcile auto-heal: phantom SELL legs {tracked_sell_ids} cleared via position qty={expected_qty}"
+                        f"🧠 {symbol} reconcile auto-heal: phantom SELL legs {tracked_sell_ids} cleared via position qty={expected_qty:g}"
                     )
                     try:
-                        record_auto_heal(conn, symbol, 'phantom_sell_cleared')
+                        record_auto_heal(conn, symbol, "phantom_sell_cleared")
                     except Exception:
                         pass
                 elif o is None and pos_qty <= 0.0:
-                    # No shares => lot is dead; remove the stale memory.
                     db_delete_lot(conn, symbol, float(lot["buy_level"]))
-                    log.info(f"🧹 {symbol} reconcile auto-heal: removed stale lot (no position, missing SELL legs {tracked_sell_ids})")
+                    log.info(
+                        f"🧹 {symbol} reconcile auto-heal: removed stale lot (no position, missing SELL legs {tracked_sell_ids})"
+                    )
                     try:
-                        record_auto_heal(conn, symbol, 'stale_lot_removed')
+                        record_auto_heal(conn, symbol, "stale_lot_removed")
                     except Exception:
                         pass
                 else:
-                    log.warning(f"🟠 {symbol} reconcile: sell_open legs {tracked_sell_ids} not open, truth unknown -> keeping lot")
+                    log.warning(
+                        f"🟠 {symbol} reconcile: sell_open legs {tracked_sell_ids} not open, truth unknown -> keeping lot"
+                    )
 
 
 # =======================
-# SIMPLE SEED (UNCHANGED)
+# SIMPLE SEED
 # =======================
+
 def seed_one_lot_if_needed(conn, symbol: str, levels, open_orders):
     try:
         existing_lots = db_list_lots(conn, symbol)
@@ -1311,7 +1387,9 @@ def seed_one_lot_if_needed(conn, symbol: str, levels, open_orders):
             return
 
         db_upsert_lot(conn, symbol, float(buy_level), float(sell_target), float(qty), "owned", buy_order_id=None, sell_order_id=None)
-        log.info(f"🧩 Seeded {symbol} memory: owned lot at buy_level={buy_level} qty={qty} (avg_entry≈{avg_price:.2f})")
+        log.info(
+            f"🧩 Seeded {symbol} memory: owned lot at buy_level={buy_level} qty={qty:g} (avg_entry≈{avg_price:.2f})"
+        )
     except Exception as e:
         log.warning(f"{symbol} seed failed: {e}")
 
@@ -1319,13 +1397,11 @@ def seed_one_lot_if_needed(conn, symbol: str, levels, open_orders):
 # =======================
 # DAILY SUMMARY
 # =======================
+
 def maybe_daily_summary(conn):
     day = utc_day()
     hour = now_utc().hour
 
-    # Ensure the baseline rows exist for the UTC day (00:00 UTC baseline concept).
-    # We store the first equity we see for the day as the baseline. This is not perfect
-    # if the process is down around midnight, but it's consistent and truly "daily".
     equity = get_account_equity()
 
     with conn.cursor() as cur:
@@ -1345,7 +1421,6 @@ def maybe_daily_summary(conn):
         return
 
     with conn.cursor() as cur:
-        # ---- equity summary ----
         cur.execute("SELECT * FROM daily_equity WHERE day=%s;", (day,))
         row = cur.fetchone()
 
@@ -1360,7 +1435,6 @@ def maybe_daily_summary(conn):
             cur.execute("UPDATE daily_equity SET summary_sent=true WHERE day=%s;", (day,))
             conn.commit()
 
-        # ---- wins summary ----
         wins_row = db_get_daily_wins(conn, day)
         if wins_row and not wins_row["summary_sent"]:
             wins = int(wins_row["wins"])
@@ -1377,6 +1451,7 @@ def maybe_daily_summary(conn):
 # =======================
 # CORE BOT
 # =======================
+
 def run_symbol(conn, symbol: str, cfg: dict, allow_new_order: bool = True):
     lower = float(cfg["lower"])
     upper = float(cfg["upper"])
@@ -1405,7 +1480,7 @@ def run_symbol(conn, symbol: str, cfg: dict, allow_new_order: bool = True):
         return finish({"symbol": symbol, "action": "error", "reason": "bad_config"})
 
     last_price = get_last_price(symbol)
-    log.info(f"📈 {symbol} PRICE = {last_price}")
+    log.info(f"📈 {symbol} PRICE = {last_price:.4f}")
 
     prev_raw = db_get_state(conn, state_key, "")
     prev_price = None
@@ -1450,20 +1525,21 @@ def run_symbol(conn, symbol: str, cfg: dict, allow_new_order: bool = True):
     if not can_place:
         log.info(f"🧊 {symbol} new orders blocked (global/rate limit mode)")
         try:
-            record_capital_saturation(conn, symbol, 'lock_rules')
+            record_capital_saturation(conn, symbol, "lock_rules")
         except Exception:
             pass
         return finish({"symbol": symbol, "action": "none", "reason": "new_orders_blocked", "price": last_price}, last_price)
 
     # =========================
-    # 1) SELL (for SEEDED positions only; bracket buys manage their own TP sells)
+    # 1) SELL (seeded positions only; bracket buys manage their own TP sells)
     # =========================
     if sell_level is not None:
         seeded_lot = db_get_seeded_lot_for_sell_level(conn, symbol, sell_level)
         if seeded_lot:
-            seeded_qty = float(seeded_lot["qty"])  # may be fractional
+            seeded_qty = float(seeded_lot["qty"])
             max_sell = min(seeded_qty, float(free_qty))
             sell_qty = normalize_qty(max_sell, allow_fractional=ALLOW_FRACTIONAL_SELLS)
+
             if sell_qty > 0 and not has_open_order_at(open_orders, "sell", sell_level):
                 try:
                     o = place_limit(symbol, "sell", sell_qty, float(sell_level))
@@ -1493,7 +1569,7 @@ def run_symbol(conn, symbol: str, cfg: dict, allow_new_order: bool = True):
                     return finish({"symbol": symbol, "action": "error", "reason": "sell_failed"}, last_price)
 
     # =========================
-    # 2) BUY (BRACKET: buy + take-profit + WIDE stop-loss)
+    # 2) BUY (BRACKET)
     # =========================
     if buy_level is not None:
         raw_qty = order_usd / float(buy_level)
@@ -1503,25 +1579,36 @@ def run_symbol(conn, symbol: str, cfg: dict, allow_new_order: bool = True):
 
         existing = db_get_lot(conn, symbol, float(buy_level))
         if existing and existing["state"] in ("buy_open", "owned", "sell_open"):
-            log.info(f"🟡 {symbol} already has memory at buy_level={float(buy_level):.2f} (state={existing['state']}), skipping BUY")
-            return finish({"symbol": symbol, "action": "none", "reason": "level_already_tracked", "buy_level": float(buy_level), "price": last_price}, last_price)
+            log.info(
+                f"🟡 {symbol} already tracked at buy_level={float(buy_level):.2f} (state={existing['state']}), skipping BUY"
+            )
+            return finish(
+                {"symbol": symbol, "action": "none", "reason": "level_already_tracked", "buy_level": float(buy_level), "price": last_price},
+                last_price,
+            )
 
         projected = used + (float(buy_qty) * float(buy_level))
         if projected > max_capital:
-            log.info(f"🟠 {symbol} BUY blocked (capital) used≈${used:,.2f} projected≈${projected:,.2f} max=${max_capital:,.2f}")
+            log.info(
+                f"🟠 {symbol} BUY blocked (capital) used≈${used:,.2f} projected≈${projected:,.2f} max=${max_capital:,.2f}"
+            )
             try:
-                record_capital_saturation(conn, symbol, f"capital used≈{used:.2f} projected≈{projected:.2f} max≈{max_capital:.2f}")
+                record_capital_saturation(conn, symbol, f"used≈{used:.2f} projected≈{projected:.2f} max≈{max_capital:.2f}")
             except Exception:
                 pass
-            # alert (rate-limited)
+
+            # Optional alert (rate-limited)
             try:
                 last_alert_ts = db_get_state(conn, "health:cap_sat_alert_ts", "")
                 cooldown_hours = max(1, int(HEALTH_ALERT_COOLDOWN_MINUTES / 60))
                 if (not last_alert_ts) or (not _recent_within_hours(last_alert_ts, cooldown_hours)):
-                    tg_send(f"3️⃣ 🧊 Capital saturation | {symbol}\nused≈${used:,.2f} projected≈${projected:,.2f} max=${max_capital:,.2f}")
+                    tg_send(
+                        f"3️⃣ 🧊 Capital saturation | {symbol}\nused≈${used:,.2f} projected≈${projected:,.2f} max=${max_capital:,.2f}"
+                    )
                     db_set_state(conn, "health:cap_sat_alert_ts", _iso_now())
             except Exception:
                 pass
+
             return finish({"symbol": symbol, "action": "none", "reason": "max_capital", "used": used, "price": last_price}, last_price)
 
         sell_target = next_level_above(levels, float(buy_level))
@@ -1592,6 +1679,7 @@ def run_symbol(conn, symbol: str, cfg: dict, allow_new_order: bool = True):
 # =======================
 # ROUTES
 # =======================
+
 @app.route("/healthz", methods=["GET"])
 def healthz():
     return "ok", 200
@@ -1626,10 +1714,8 @@ def run():
             if res.get("action") in ("buy", "sell"):
                 new_orders_left -= 1
 
-        # health checks (NEW)
         maybe_alert_lot_stuck(conn)
         compute_confidence_score(conn)
-
         maybe_daily_summary(conn)
 
         conn.commit()
@@ -1656,11 +1742,18 @@ def run():
 @app.route("/board", methods=["GET"])
 def board():
     token = request.headers.get("X-RUN-TOKEN", "")
-    if RUN_TOKEN and token != RUN_TOKEN:
-        return "Unauthorized", 401
 
-    lines = [f"🦁 Leo Board | Paper={PAPER} | TradingEnabled={TRADING_ENABLED} | {now_utc().isoformat()}"]
-    # health snapshot (NEW)
+    # ✅ In LIVE mode, /board also requires the token (no accidental exposure).
+    if not PAPER:
+        if not RUN_TOKEN or token != RUN_TOKEN:
+            return "Unauthorized", 401
+    else:
+        # In paper mode, if RUN_TOKEN is set, require it.
+        if RUN_TOKEN and token != RUN_TOKEN:
+            return "Unauthorized", 401
+
+    lines = [f"🦁 Leo Board | Paper={PAPER} | TradingEnabled={TRADING_ENABLED} | {now_utc().isoformat()} | SL_PCT={STOP_LOSS_PCT:.2%}"]
+
     try:
         conn = pg_conn()
         try:
@@ -1670,6 +1763,7 @@ def board():
             cap_last = db_get_state(conn, "health:cap_sat_last", "")
             ah_last = db_get_state(conn, "health:auto_heal_last", "")
             stuck_now = detect_stuck_lots(conn, LOT_STUCK_MINUTES)
+
             lines.append(f"5️⃣ 🧠 Confidence: {score}/100")
             lines.append(f"6️⃣ 📊 Total P/L (since start): ${pnl_total:,.2f}")
             if stuck_now:
@@ -1680,12 +1774,8 @@ def board():
                 lines.append(f"1️⃣ 🧠 Auto-heal: {ah_last}")
             if err_last:
                 lines.append(f"4️⃣ 🚨 Error: {err_last}")
+        finally:
             conn.close()
-        except Exception:
-            try:
-                conn.close()
-            except Exception:
-                pass
     except Exception:
         pass
 
@@ -1700,7 +1790,7 @@ def board():
             p = get_last_price(sym)
             pos = get_position_qty(sym)
             oo = get_open_orders(sym)
-            lines.append(f"📈 {sym} | price={p:.2f} | pos={pos} | open_orders={len(oo)}")
+            lines.append(f"📈 {sym} | price={p:.2f} | pos={pos:g} | open_orders={len(oo)}")
         except Exception as e:
             lines.append(f"⚠️ {sym} board error: {e}")
 
@@ -1719,8 +1809,10 @@ def telegram_webhook():
             return "ok", 200
 
         if msg.strip().lower() == "/status":
-            lines = [f"🦁 Leo status | Paper={PAPER} | TradingEnabled={TRADING_ENABLED} | SL_PCT={STOP_LOSS_PCT:.2%}"]
-            # health snapshot (NEW)
+            lines = [
+                f"🦁 Leo status | Paper={PAPER} | TradingEnabled={TRADING_ENABLED} | SL_PCT={STOP_LOSS_PCT:.2%} | FileLog={'on' if (LOG_TO_FILE and (not PAPER)) else 'off'}"
+            ]
+
             try:
                 conn = pg_conn()
                 try:
@@ -1730,6 +1822,7 @@ def telegram_webhook():
                     cap_last = db_get_state(conn, "health:cap_sat_last", "")
                     ah_last = db_get_state(conn, "health:auto_heal_last", "")
                     stuck_now = detect_stuck_lots(conn, LOT_STUCK_MINUTES)
+
                     lines.append(f"5️⃣ 🧠 Confidence: {score}/100")
                     lines.append(f"6️⃣ 📊 Total P/L (since start): ${pnl_total:,.2f}")
                     if stuck_now:
@@ -1740,20 +1833,21 @@ def telegram_webhook():
                         lines.append(f"1️⃣ 🧠 Auto-heal: {ah_last}")
                     if err_last:
                         lines.append(f"4️⃣ 🚨 Error: {err_last}")
+                finally:
                     conn.close()
-                except Exception:
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
             except Exception:
                 pass
 
-            for sym, cfg in BOTS.items():
-                p = get_last_price(sym)
-                pos = get_position_qty(sym)
-                lines.append(f"{sym} price={p:.2f} pos={pos}")
+            for sym in BOTS.keys():
+                try:
+                    p = get_last_price(sym)
+                    pos = get_position_qty(sym)
+                    lines.append(f"{sym} price={p:.2f} pos={pos:g}")
+                except Exception:
+                    pass
+
             tg_send("\n".join(lines))
+
         return "ok", 200
     except Exception as e:
         log.warning(f"telegram webhook error: {e}")
@@ -1763,9 +1857,11 @@ def telegram_webhook():
 # =======================
 # START
 # =======================
+
 if __name__ == "__main__":
     init_db()
-    log.info(f"🦁 Leo started v4.1.1 ({'Paper' if PAPER else 'Live'} Trading)")
-    tg_send(f"🦁 Leo started v4.1.1 ({'Paper' if PAPER else 'Live'} Trading) | SL_PCT={STOP_LOSS_PCT:.2%}")
+    mode = "Paper" if PAPER else "Live"
+    log.info(f"🦁 Leo started v4.2.1_PATCH ({mode} Trading) | SL_PCT={STOP_LOSS_PCT:.2%}")
+    tg_send(f"🦁 Leo started v4.2.1_PATCH ({mode} Trading) | SL_PCT={STOP_LOSS_PCT:.2%}")
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
