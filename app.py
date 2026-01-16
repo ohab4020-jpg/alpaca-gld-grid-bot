@@ -598,6 +598,62 @@ def record_error(conn, detail: str) -> None:
     db_set_state(conn, "health:error_last_ts", _iso_now())
     db_set_state(conn, "health:error_last", str(detail)[:500])
 
+# =======================
+# ALERT AGGREGATION (HOURLY)
+# =======================
+
+def _hour_bucket_key(prefix: str) -> str:
+    t = now_utc()
+    return f"{prefix}:{t.strftime('%Y%m%d%H')}"
+
+def record_warning(conn, detail: str) -> None:
+    # Aggregate warnings to send at most once per hour.
+    try:
+        b = _hour_bucket_key('warn')
+        db_inc_state(conn, f'{b}:count', 1)
+        # Keep a small sample set for context (max 5).
+        sample_key = f'{b}:samples'
+        raw = db_get_state(conn, sample_key, '')
+        samples = [x for x in raw.split('||') if x] if raw else []
+        if len(samples) < 5:
+            samples.append(str(detail)[:200])
+            db_set_state(conn, sample_key, '||'.join(samples))
+    except Exception:
+        pass
+
+def record_nonfatal_error(conn, detail: str) -> None:
+    # Count as error (existing health counters) and also as a warning for hourly summary.
+    try:
+        record_error(conn, detail)
+    except Exception:
+        pass
+    try:
+        record_warning(conn, detail)
+    except Exception:
+        pass
+
+def maybe_send_hourly_warning_summary(conn) -> None:
+    # Send at most one warning summary per hour (only if warnings occurred).
+    try:
+        b = _hour_bucket_key('warn')
+        sent_key = f'{b}:sent'
+        if db_get_state(conn, sent_key, '') == '1':
+            return
+        count = db_get_state_int(conn, f'{b}:count', 0)
+        if count <= 0:
+            return
+        samples_raw = db_get_state(conn, f'{b}:samples', '')
+        samples = [x for x in samples_raw.split('||') if x] if samples_raw else []
+        lines = [f'⚠️ BOT WARNINGS (last hour UTC)', f'Count: {count}']
+        for s in samples[:5]:
+            lines.append(f'- {s}')
+        # Exactly-once via outbox
+        eid = f'warn_summary:{b}'
+        tg_enqueue_event(conn, eid, 'warning', '\n'.join(lines))
+        db_set_state(conn, sent_key, '1')
+    except Exception as e:
+        log.warning(f'Hourly warning summary failed: {e}')
+
 
 def detect_stuck_lots(conn, minutes: int):
     mins = int(minutes)
@@ -1647,56 +1703,93 @@ def seed_one_lot_if_needed(conn, symbol: str, levels, open_orders):
 # DAILY SUMMARY
 # =======================
 
-def maybe_daily_summary(conn):
+def maybe_daily_strategy_summary(conn):
+    """Daily Telegram summary based on REALIZED PnL (lot_closures) - exactly once per UTC day."""
     day = utc_day()
     hour = now_utc().hour
 
-    equity = get_account_equity()
-
-    with conn.cursor() as cur:
-        cur.execute("SELECT 1 FROM daily_equity WHERE day=%s;", (day,))
-        if cur.fetchone() is None:
-            cur.execute(
-                "INSERT INTO daily_equity(day, start_equity, summary_sent) VALUES(%s, %s, false);",
-                (day, equity),
-            )
-            cur.execute(
-                "INSERT INTO daily_wins(day, wins, wins_pnl, summary_sent) VALUES(%s, 0, 0, false) ON CONFLICT(day) DO NOTHING;",
-                (day,),
-            )
-            conn.commit()
-
+    # Wait until configured UTC hour
     if hour < DAILY_SUMMARY_HOUR_UTC:
         return
 
-    with conn.cursor() as cur:
-        cur.execute("SELECT * FROM daily_equity WHERE day=%s;", (day,))
-        row = cur.fetchone()
+    # Exactly-once per day via outbox id
+    eid = f"daily_strategy:{day.isoformat()}"
 
-        if row and not row["summary_sent"]:
-            start_equity = float(row["start_equity"])
-            pnl = equity - start_equity
+    # If already enqueued, skip building/sending again.
+    if tg_enabled():
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM telegram_events WHERE event_id=%s;", (eid,))
+                if cur.fetchone() is not None:
+                    return
+        except Exception:
+            # If we cannot check, fail silent here - do not risk spam.
+            return
 
-            text = f"📊 DAILY P&L (UTC {day})\nEquity: ${equity:,.2f}\nPnL: ${pnl:,.2f}"
-            log.info(text.replace("\n", " | "))
-            tg_send(text)
+    # Daily realized PnL and win/loss counts based on closures
+    daily_pnl = 0.0
+    wins = 0
+    losses = 0
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT outcome, SUM(pnl_usd) AS pnl, COUNT(*) AS n
+                FROM lot_closures
+                WHERE symbol IS NOT NULL
+                  AND (closed_at AT TIME ZONE 'UTC')::date = %s
+                GROUP BY outcome;
+                """,
+                (day,),
+            )
+            rows = cur.fetchall() or []
+        for r in rows:
+            try:
+                out = str(r.get('outcome') or '')
+                pnl = float(r.get('pnl') or 0.0)
+                n = int(r.get('n') or 0)
+            except Exception:
+                continue
+            daily_pnl += pnl
+            if out == 'tp':
+                wins += n
+            elif out == 'sl':
+                losses += n
+            else:
+                # Treat other outcomes as neutral; keep counts separate from tp/sl.
+                pass
+    except Exception as e:
+        try:
+            record_warning(conn, f"daily summary query failed: {e}")
+        except Exception:
+            pass
+        return
 
-            cur.execute("UPDATE daily_equity SET summary_sent=true WHERE day=%s;", (day,))
-            conn.commit()
+    total_trades = wins + losses
+    win_rate = (wins / total_trades * 100.0) if total_trades > 0 else 0.0
 
-        wins_row = db_get_daily_wins(conn, day)
-        if wins_row and not wins_row["summary_sent"]:
-            wins = int(wins_row["wins"])
-            wins_pnl = float(wins_row["wins_pnl"])
+    baseline = float(BASELINE_CAPITAL) if float(BASELINE_CAPITAL) > 0 else 0.0
+    cum = strategy_get_cum_realized_pnl(conn)
+    net = baseline + cum
+    pct = (cum / baseline * 100.0) if baseline > 0 else 0.0
 
-            msg = f"🏆 DAILY WINS (UTC {day})\nTP wins: {wins}\nTP PnL: ${wins_pnl:,.2f}"
-            log.info(msg.replace("\n", " | "))
-            tg_send(msg)
+    txt = (
+        f"📊 DAILY STRATEGY SUMMARY (UTC {day})\n\n"
+        f"Daily realized PnL: ${daily_pnl:,.2f}\n"
+        f"Daily wins/losses: {wins}W / {losses}L\n"
+        f"Daily win rate: {win_rate:.1f}%\n\n"
+        f"Baseline capital: ${baseline:,.2f}\n"
+        f"Cumulative realized PnL: ${cum:,.2f}\n"
+        f"Net strategy equity: ${net:,.2f}\n"
+        f"Return vs baseline: {pct:+.2f}%"
+    )
 
-            db_mark_daily_wins_sent(conn, day)
-            conn.commit()
+    tg_enqueue_event(conn, eid, 'strategy', txt)
 
 
+# =======================
+# CORE BOT
+# =======================
 # =======================
 # CORE BOT
 # =======================
@@ -1740,7 +1833,7 @@ def run_symbol(conn, symbol: str, cfg: dict, allow_new_order: bool = True):
 
     if not (lower <= last_price <= upper):
         log.info(f"🟡 {symbol} outside band [{lower}, {upper}]")
-        tg_send(f"🟡 {symbol} outside band [{lower}, {upper}] | price={last_price:.2f}")
+        # Telegram outside-band alerts disabled (log only)
         return finish({"symbol": symbol, "action": "none", "reason": "outside_band", "price": last_price}, last_price)
 
     levels = build_geometric_levels(lower, upper, grid_pct)
@@ -1810,9 +1903,8 @@ def run_symbol(conn, symbol: str, cfg: dict, allow_new_order: bool = True):
                 except Exception as e:
                     msg = f"❌ SELL failed | {symbol} | {e}"
                     log.error(msg)
-                    tg_send(msg)
                     try:
-                        record_error(conn, msg)
+                        record_nonfatal_error(conn, msg)
                     except Exception:
                         pass
                     return finish({"symbol": symbol, "action": "error", "reason": "sell_failed"}, last_price)
@@ -1911,9 +2003,8 @@ def run_symbol(conn, symbol: str, cfg: dict, allow_new_order: bool = True):
             except Exception as e:
                 msg = f"❌ BUY failed | {symbol} | {e}"
                 log.error(msg)
-                tg_send(msg)
                 try:
-                    record_error(conn, msg)
+                    record_nonfatal_error(conn, msg)
                 except Exception:
                     pass
                 return finish({"symbol": symbol, "action": "error", "reason": "buy_failed"}, last_price)
@@ -1965,7 +2056,8 @@ def run():
 
         maybe_alert_lot_stuck(conn)
         compute_confidence_score(conn)
-        maybe_daily_summary(conn)
+        maybe_daily_strategy_summary(conn)
+        maybe_send_hourly_warning_summary(conn)
         tg_flush_outbox(conn)
 
         conn.commit()
@@ -1974,7 +2066,15 @@ def run():
         conn.rollback()
         msg = f"❌ /run crashed: {e}"
         log.exception(msg)
-        tg_send(msg)
+        try:
+            # Critical alert (enqueue for exactly-once); fallback to direct send if needed.
+            tg_enqueue_event(conn, f'critical:run_crash:{utc_day().isoformat()}:{now_utc().hour}', 'critical', msg)
+            tg_flush_outbox(conn)
+        except Exception:
+            try:
+                tg_send(msg)
+            except Exception:
+                pass
         try:
             record_error(conn, msg)
             conn.commit()
